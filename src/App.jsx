@@ -208,9 +208,17 @@ const LOGO_DOMAIN_MAP = {
 };
 
 function CompanyIcon({ ticker, size = 44 }) {
-  const [failed, setFailed] = useState(false);
+  const [sourceIndex, setSourceIndex] = useState(0);
   const domain = LOGO_DOMAIN_MAP[ticker.toUpperCase()];
-  if (!domain || failed) {
+
+  const sources = domain
+    ? [
+        `https://logo.clearbit.com/${domain}?size=128`,
+        `https://www.google.com/s2/favicons?domain=${domain}&sz=128`,
+      ]
+    : [];
+
+  if (!domain || sourceIndex >= sources.length) {
     const cat = CATEGORY_MAP[ticker.toUpperCase()] || "Inne";
     const color = CATEGORY_COLORS[cat] || "#94a3b8";
     return (
@@ -225,10 +233,10 @@ function CompanyIcon({ ticker, size = 44 }) {
   return (
     <div className="rounded-xl bg-white flex items-center justify-center overflow-hidden" style={{ width: size, height: size }}>
       <img
-        src={`https://logo.clearbit.com/${domain}?size=128`}
+        src={sources[sourceIndex]}
         alt=""
         className="w-full h-full object-contain p-1"
-        onError={() => setFailed(true)}
+        onError={() => setSourceIndex((i) => i + 1)}
       />
     </div>
   );
