@@ -1971,12 +1971,12 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
         } else {
           const tf = TIMEFRAMES.find((t) => t.key === timeframe);
           const rangeIntervalMap = {
-            "1t": { range: "5d", interval: "30m" },
-            "1m": { range: "1mo", interval: "1d" },
+            "1t": { range: "1mo", interval: "1d" },
+            "1m": { range: "3mo", interval: "1d" },
             "6m": { range: "6mo", interval: "1d" },
             "1r": { range: "1y", interval: "1d" },
-            "5l": { range: "5y", interval: "1wk" },
-            max: { range: "max", interval: "1mo" },
+            "5l": { range: "5y", interval: "1d" },
+            max: { range: "max", interval: "1wk" },
           };
           const cfg = rangeIntervalMap[timeframe] || { range: "3mo", interval: "1d" };
           const yahooSymbol = toYahooSymbol(ticker);
@@ -2122,8 +2122,8 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
           </div>
           {!loadingHistory && usingOwnData && (
             <p className="text-xs text-slate-600 mt-2">
-              {timeframe === "1d" && historyError && historyError.includes("klucza API")
-                ? historyError
+              {historyError
+                ? `Pełna historia notowań niedostępna: ${historyError}`
                 : "Pełna historia notowań chwilowo niedostępna — wykres pokazuje Twoje własne transakcje."}
             </p>
           )}

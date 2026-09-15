@@ -27,7 +27,7 @@ export default async function handler(req, res) {
     const timestamps = result.timestamp || [];
     const closes = result.indicators?.quote?.[0]?.close || [];
     const rows = timestamps
-      .map((t, i) => ({ date: new Date(t * 1000).toISOString().slice(0, 10), close: closes[i] }))
+      .map((t, i) => ({ date: new Date(t * 1000).toISOString(), close: closes[i] }))
       .filter((r) => Number.isFinite(r.close) && r.close > 0);
 
     const dividends = result.events?.dividends
