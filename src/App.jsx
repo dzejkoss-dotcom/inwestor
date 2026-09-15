@@ -1695,14 +1695,14 @@ function StatystykiTab({ transactions, portfolios, prices }) {
     portfolioSeries.push(localMetrics.currentValueTotal);
 
     const series = {};
-    let anyError = "";
+    const errorsByBenchmark = {};
     for (const key of selectedBenchmarks) {
       const bench = BENCHMARKS.find((b) => b.key === key);
       try {
         const rows = await fetchYahooSeries(bench.symbol, "5y");
         series[key] = simulateBenchmarkSeries(sortedTxs, rows, now.getTime());
       } catch (e) {
-        anyError = anyError || `${bench.label}: ${String(e.message || e)}`;
+        errorsByBenchmark[key] = `${bench.label}: ${String(e.message || e)}`;
       }
     }
 
@@ -1717,7 +1717,7 @@ function StatystykiTab({ transactions, portfolios, prices }) {
 
     setBenchmarkSeries(merged);
     setBenchmarkResults(series);
-    if (Object.keys(series).length === 0 && anyError) setBenchmarkError(anyError);
+    setBenchmarkError(Object.values(errorsByBenchmark).join(" · "));
     setLoadingBenchmarks(false);
   }
 
@@ -1980,6 +1980,8 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
     return new Date(Date.now() - tf.days * 24 * 60 * 60 * 1000);
   }, [timeframe, tickerTx]);
 
+  const [historyDebug, setHistoryDebug] = useState("");
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -1992,9 +1994,11 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
           const isUS = ticker.toUpperCase().endsWith(".US");
           const bareSymbol = ticker.replace(/\.(US|PL)$/i, "");
           const rows = await fetchTwelveDataIntraday(bareSymbol, isPL ? "XWAR" : null, twelveDataKey);
-          if (!cancelled) setHistorySeries(rows.map((r) => ({ t: r.t, price: r.close })));
+          if (!cancelled) {
+            setHistorySeries(rows.map((r) => ({ t: r.t, price: r.close })));
+            setHistoryDebug(`Twelve Data ${bareSymbol} · ${rows.length} pkt`);
+          }
         } else {
-          const tf = TIMEFRAMES.find((t) => t.key === timeframe);
           const rangeIntervalMap = {
             "1t": { range: "1mo", interval: "1d" },
             "1m": { range: "3mo", interval: "1d" },
@@ -2006,10 +2010,13 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
           const cfg = rangeIntervalMap[timeframe] || { range: "3mo", interval: "1d" };
           const yahooSymbol = toYahooSymbol(ticker);
           const rows = await fetchYahooSeries(yahooSymbol, cfg.range, cfg.interval);
-          if (!cancelled) setHistorySeries(rows.map((r) => ({ t: new Date(r.date).getTime(), price: r.close })));
+          if (!cancelled) {
+            setHistorySeries(rows.map((r) => ({ t: new Date(r.date).getTime(), price: r.close })));
+            setHistoryDebug(`Yahoo ${yahooSymbol} (${cfg.range}/${cfg.interval}) · ${rows.length} pkt`);
+          }
         }
       } catch (e) {
-        if (!cancelled) { setHistoryError(String(e.message || e)); setHistorySeries(null); }
+        if (!cancelled) { setHistoryError(String(e.message || e)); setHistorySeries(null); setHistoryDebug(""); }
       }
       if (!cancelled) setLoadingHistory(false);
     })();
@@ -2058,6 +2065,9 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
 
         <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4 mb-4">
           <p className="text-2xl tabular-nums tracking-tight font-bold tracking-tight mb-1">{fmtPLN(currentPrice)}</p>
+          <p className="text-[10px] text-slate-600 mb-1">
+            {loadingHistory ? "Ładuję…" : historyDebug ? `✓ ${historyDebug}` : historyError ? `✗ ${historyError}` : ""}
+          </p>
           {chartData.length > 1 && (() => {
             const periodStart = chartData[0].price;
             const periodEnd = chartData[chartData.length - 1].price;
