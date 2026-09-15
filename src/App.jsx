@@ -28,7 +28,7 @@ if (typeof window !== "undefined" && !window.storage) {
 import {
   PieChart, Pie, Cell, ResponsiveContainer, AreaChart, Area,
   XAxis, YAxis, Tooltip, CartesianGrid, BarChart, Bar, LabelList,
-  ComposedChart, Line, Scatter,
+  ComposedChart, Line, Scatter, Legend,
 } from "recharts";
 import {
   Plus, TrendingUp, TrendingDown, RefreshCw, X, Wallet,
@@ -88,6 +88,7 @@ const CURRENCIES = ["PLN", "USD", "EUR"];
 const STORAGE_KEY = "portfolio:transactions";
 const PORTFOLIOS_KEY = "portfolio:portfolios";
 const PRICES_KEY = "portfolio:prices-cache";
+const DIVIDENDS_KEY = "portfolio:dividends-cache";
 const TWELVEDATA_KEY_STORAGE = "portfolio:twelvedata-api-key";
 const SEED_FLAG_KEY = "portfolio:xtb-seed-2026-09-08-v2-applied";
 const SEED_TAG = "xtb-file-seed";
@@ -253,6 +254,12 @@ const BENCHMARKS = [
 function fmtPLN(n) {
   const v = Number.isFinite(n) ? n : 0;
   return new Intl.NumberFormat("pl-PL", { style: "currency", currency: "PLN", maximumFractionDigits: 2 }).format(v);
+}
+function fmtPLNShort(n) {
+  const v = Number.isFinite(n) ? n : 0;
+  if (Math.abs(v) >= 1000000) return (v / 1000000).toFixed(1).replace(/\.0$/, "") + " mln";
+  if (Math.abs(v) >= 1000) return Math.round(v / 1000) + "k";
+  return Math.round(v).toString();
 }
 function fmtPct(n) {
   const v = Number.isFinite(n) ? n : 0;
@@ -503,13 +510,30 @@ function toYahooSymbol(ticker) {
   return upper;
 }
 
-async function fetchYahooSeries(yahooSymbol, range) {
-  const url = `/api/yahoo-proxy?symbol=${encodeURIComponent(yahooSymbol)}&range=${range || "3mo"}&interval=1d`;
+async function fetchYahooSeries(yahooSymbol, range, interval) {
+  const url = `/api/yahoo-proxy?symbol=${encodeURIComponent(yahooSymbol)}&range=${range || "3mo"}&interval=${interval || "1d"}`;
   const resp = await fetch(url);
   const data = await resp.json();
   if (!resp.ok || data.error) throw new Error(data.error || "Błąd Yahoo Finance");
   if (!data.rows || !data.rows.length) throw new Error("Yahoo: brak danych dla " + yahooSymbol);
   return data.rows;
+}
+
+async function fetchYahooDividends(yahooSymbol) {
+  const url = `/api/yahoo-proxy?symbol=${encodeURIComponent(yahooSymbol)}&range=max&interval=1mo&events=div`;
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (!resp.ok || data.error) throw new Error(data.error || "Błąd Yahoo Finance");
+  return data.dividends || [];
+}
+
+function quantityHeldOnDate(tickerTxSorted, dateMs) {
+  let qty = 0;
+  for (const t of tickerTxSorted) {
+    if (new Date(t.date).getTime() > dateMs) break;
+    qty += t.type === "buy" ? Number(t.quantity) : -Number(t.quantity);
+  }
+  return qty;
 }
 
 async function fetchYahooQuote(ticker, usdPlnRate) {
@@ -579,6 +603,7 @@ export default function App() {
   const [transactions, setTransactions] = useState([]);
   const [portfolios, setPortfolios] = useState([]);
   const [prices, setPrices] = useState({});
+  const [dividends, setDividends] = useState({ total: 0, byYear: {}, lastUpdated: null, error: "" });
   const [loaded, setLoaded] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [showForm, setShowForm] = useState(false);
@@ -663,6 +688,10 @@ export default function App() {
         if (p?.value) setPrices(JSON.parse(p.value));
       } catch (e) {}
       try {
+        const d = await window.storage.get(DIVIDENDS_KEY, false);
+        if (d?.value) setDividends(JSON.parse(d.value));
+      } catch (e) {}
+      try {
         const k = await window.storage.get(TWELVEDATA_KEY_STORAGE, false);
         if (k?.value) setTwelveDataKey(k.value);
       } catch (e) {}
@@ -719,10 +748,10 @@ export default function App() {
       cagr = calculateXIRR(cashflows);
     }
     const unrealizedPnL = currentValueTotal - costBasisTotal;
-    const totalProfit = unrealizedPnL + realizedPnL;
+    const totalProfit = unrealizedPnL + realizedPnL + dividends.total;
     const totalProfitPercent = totalInvested > 0 ? (totalProfit / totalInvested) * 100 : 0;
     return { costBasisTotal, currentValueTotal, dailyChangePLN, dailyChangePercent, cagr, years, unrealizedPnL, totalProfit, totalProfitPercent };
-  }, [holdings, prices, transactions, realizedPnL, totalInvested]);
+  }, [holdings, prices, transactions, realizedPnL, totalInvested, dividends.total]);
 
   const investedOverTime = useMemo(() => {
     const sorted = [...transactions].sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -894,6 +923,53 @@ export default function App() {
     setRefreshing(false);
   }, [holdings, prices, twelveDataKey]);
 
+  const refreshDividends = useCallback(async () => {
+    const byTicker = {};
+    for (const t of transactions) {
+      const key = t.ticker.toUpperCase();
+      if (!byTicker[key]) byTicker[key] = [];
+      byTicker[key].push(t);
+    }
+    const tickers = Object.keys(byTicker);
+    if (!tickers.length) return;
+
+    let usdPlnRate = null;
+    try {
+      const rows = await fetchYahooSeries("PLN=X", "5d");
+      usdPlnRate = rows[rows.length - 1].close;
+    } catch (e) {}
+
+    let total = 0;
+    const byYear = {};
+    let anyError = "";
+    let anySuccess = false;
+    for (const ticker of tickers) {
+      const sortedTxs = [...byTicker[ticker]].sort((a, b) => new Date(a.date) - new Date(b.date));
+      try {
+        const yahooSymbol = toYahooSymbol(ticker);
+        const divs = await fetchYahooDividends(yahooSymbol);
+        const isUS = ticker.toUpperCase().endsWith(".US");
+        const fx = isUS ? (usdPlnRate || 1) : 1;
+        for (const d of divs) {
+          const dateMs = new Date(d.date).getTime();
+          const qty = quantityHeldOnDate(sortedTxs, dateMs);
+          if (qty > 0) {
+            const amountPLN = qty * d.amount * fx;
+            total += amountPLN;
+            const year = new Date(d.date).getFullYear();
+            byYear[year] = (byYear[year] || 0) + amountPLN;
+          }
+        }
+        anySuccess = true;
+      } catch (e) {
+        anyError = anyError || `${ticker}: ${String(e.message || e)}`;
+      }
+    }
+    const result = { total, byYear, lastUpdated: Date.now(), error: anySuccess ? "" : anyError };
+    setDividends(result);
+    window.storage.set(DIVIDENDS_KEY, JSON.stringify(result), false).catch(() => {});
+  }, [transactions]);
+
   const isPositive = metrics.dailyChangePLN >= 0;
 
   if (selectedTicker) {
@@ -924,7 +1000,7 @@ export default function App() {
             <h1 className="text-lg font-bold tracking-tight">Mój portfel</h1>
           </div>
           <button
-            onClick={refreshPrices}
+            onClick={() => { refreshPrices(); refreshDividends(); }}
             disabled={refreshing || !holdings.length}
             className="flex items-center gap-1.5 text-xs text-slate-400 disabled:opacity-40 active:scale-95 transition-transform"
           >
@@ -963,6 +1039,9 @@ export default function App() {
             <p className={`text-xs tabular-nums tracking-tight ${metrics.totalProfit >= 0 ? "text-emerald-500" : "text-rose-500"}`}>
               {fmtPct(metrics.totalProfitPercent)}
             </p>
+            {dividends.total > 0 && (
+              <p className="text-[10px] text-slate-500 mt-0.5">w tym dywidendy: {fmtPLN(dividends.total)}</p>
+            )}
           </div>
         </div>
 
@@ -1172,6 +1251,37 @@ export default function App() {
                   })}
               </div>
             </div>
+
+            {Object.keys(dividends.byYear).length > 0 && (
+              <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4 mt-4">
+                <p className="text-sm font-bold mb-1">Dywidendy wg roku</p>
+                <p className="text-xs text-slate-500 mb-3">Łącznie: {fmtPLN(dividends.total)}</p>
+                <div style={{ height: 140 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={Object.entries(dividends.byYear).sort(([a], [b]) => a - b).map(([year, amount]) => ({ year, amount }))}>
+                      <XAxis dataKey="year" tick={{ fontSize: 10, fill: "#94a3b8" }} axisLine={{ stroke: "#1e293b" }} tickLine={false} />
+                      <YAxis tick={{ fontSize: 10, fill: "#64748b" }} tickFormatter={(v) => fmtPLNShort(v)} width={40} />
+                      <Tooltip
+                        cursor={{ fill: "transparent" }}
+                        formatter={(v) => fmtPLN(v)}
+                        contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
+                        itemStyle={{ color: "#e2e8f0" }}
+                        labelStyle={{ color: "#94a3b8" }}
+                      />
+                      <Bar dataKey="amount" fill="#34d399" radius={[6, 6, 0, 0]} isAnimationActive />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                {dividends.lastUpdated && (
+                  <p className="text-[10px] text-slate-600 mt-2">
+                    Zaktualizowano: {new Date(dividends.lastUpdated).toLocaleDateString("pl-PL")}
+                  </p>
+                )}
+              </div>
+            )}
+            {dividends.error && Object.keys(dividends.byYear).length === 0 && (
+              <p className="text-xs text-slate-600 mt-3">Dywidendy: {dividends.error}</p>
+            )}
           </>
         )}
 
@@ -1492,6 +1602,7 @@ function StatystykiTab({ transactions, portfolios, prices }) {
   const [filterPortfolio, setFilterPortfolio] = useState("all");
   const [selectedBenchmarks, setSelectedBenchmarks] = useState([]);
   const [benchmarkResults, setBenchmarkResults] = useState({});
+  const [benchmarkSeries, setBenchmarkSeries] = useState([]);
   const [loadingBenchmarks, setLoadingBenchmarks] = useState(false);
   const [benchmarkError, setBenchmarkError] = useState("");
 
@@ -1515,7 +1626,7 @@ function StatystykiTab({ transactions, portfolios, prices }) {
     const unrealizedPnL = currentValueTotal - costBasisTotal;
     const totalProfit = unrealizedPnL + realizedPnL;
     const totalProfitPercent = totalInvested > 0 ? (totalProfit / totalInvested) * 100 : 0;
-    return { totalProfitPercent };
+    return { totalProfitPercent, currentValueTotal, realizedPnL };
   }, [holdings, prices, realizedPnL, totalInvested]);
 
   const investedOverTime = useMemo(() => {
@@ -1548,39 +1659,68 @@ function StatystykiTab({ transactions, portfolios, prices }) {
     setSelectedBenchmarks((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   }
 
+  function priceOnOrBefore(rows, dateMs) {
+    let ans = rows[0]?.close;
+    for (const r of rows) {
+      if (new Date(r.date).getTime() <= dateMs) ans = r.close;
+      else break;
+    }
+    return ans;
+  }
+
+  function simulateBenchmarkSeries(sortedTxs, benchRows, nowMs) {
+    let units = 0;
+    const points = [];
+    for (const t of sortedTxs) {
+      const dateMs = new Date(t.date).getTime();
+      const cash = (t.type === "buy" ? 1 : -1) * Number(t.quantity) * Number(t.price);
+      const price = priceOnOrBefore(benchRows, dateMs) || 1;
+      units += cash / price;
+      points.push(Math.max(units * price, 0));
+    }
+    const lastPrice = benchRows[benchRows.length - 1].close;
+    points.push(Math.max(units * lastPrice, 0));
+    return points;
+  }
+
   async function runComparison() {
     if (!selectedBenchmarks.length || !filteredTransactions.length) return;
     setLoadingBenchmarks(true);
     setBenchmarkError("");
-    const earliest = new Date(Math.min(...filteredTransactions.map((t) => new Date(t.date).getTime())));
-    const results = {};
+    const sortedTxs = [...filteredTransactions].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const now = new Date();
+
+    const portfolioSeries = investedOverTime.map((p) => p.value);
+    portfolioSeries.push(localMetrics.currentValueTotal);
+
+    const series = {};
     let anyError = "";
     for (const key of selectedBenchmarks) {
       const bench = BENCHMARKS.find((b) => b.key === key);
       try {
-        const allRows = await fetchYahooSeries(bench.symbol, "5y");
-        const earliestMs = earliest.getTime();
-        const rows = allRows.filter((r) => new Date(r.date).getTime() >= earliestMs);
-        const usable = rows.length >= 2 ? rows : allRows;
-        const first = usable[0].close;
-        const last = usable[usable.length - 1].close;
-        results[key] = ((last - first) / first) * 100;
+        const rows = await fetchYahooSeries(bench.symbol, "5y");
+        series[key] = simulateBenchmarkSeries(sortedTxs, rows, now.getTime());
       } catch (e) {
-        anyError = anyError || String(e.message || e);
+        anyError = anyError || `${bench.label}: ${String(e.message || e)}`;
       }
     }
-    setBenchmarkResults(results);
-    if (Object.keys(results).length === 0 && anyError) setBenchmarkError(anyError);
+
+    const dates = [...sortedTxs.map((t) => t.date), now.toISOString()];
+    const merged = dates.map((date, i) => {
+      const point = { date, "Twój portfel": portfolioSeries[i] };
+      for (const key of selectedBenchmarks) {
+        if (series[key]) point[BENCHMARKS.find((b) => b.key === key).label] = series[key][i];
+      }
+      return point;
+    });
+
+    setBenchmarkSeries(merged);
+    setBenchmarkResults(series);
+    if (Object.keys(series).length === 0 && anyError) setBenchmarkError(anyError);
     setLoadingBenchmarks(false);
   }
 
-  const comparisonData = [
-    { name: "Twój portfel", value: localMetrics.totalProfitPercent },
-    ...selectedBenchmarks
-      .filter((k) => benchmarkResults[k] != null)
-      .map((k) => ({ name: BENCHMARKS.find((b) => b.key === k).label, value: benchmarkResults[k] })),
-  ];
-
+  const seriesColors = ["#fbbf24", "#60a5fa", "#34d399", "#f472b6", "#a78bfa", "#fb923c"];
   const noHighlightCursor = { fill: "transparent" };
 
   return (
@@ -1705,28 +1845,51 @@ function StatystykiTab({ transactions, portfolios, prices }) {
           <p className="text-xs text-rose-400 mb-3">Nie udało się pobrać danych benchmarku: {benchmarkError}</p>
         )}
 
-        {comparisonData.length > 1 && (
-          <div style={{ height: 160 }}>
+        {benchmarkSeries.length > 1 && (
+          <div style={{ height: 220 }}>
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={comparisonData}>
-                <XAxis dataKey="name" tick={{ fontSize: 10, fill: "#94a3b8" }} />
-                <YAxis tick={{ fontSize: 10, fill: "#64748b" }} tickFormatter={(v) => `${v}%`} />
-                <Tooltip
-                  cursor={noHighlightCursor}
-                  formatter={(v) => fmtPct(v)}
-                  contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
-                      itemStyle={{ color: "#e2e8f0" }}
-                      labelStyle={{ color: "#94a3b8" }}
+              <ComposedChart data={benchmarkSeries} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
+                <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d) => new Date(d).toLocaleDateString("pl-PL", { month: "short", year: "2-digit" })}
+                  tick={{ fontSize: 10, fill: "#64748b" }}
+                  axisLine={{ stroke: "#1e293b" }}
+                  tickLine={false}
+                  minTickGap={30}
                 />
-                <Bar dataKey="value" radius={[6, 6, 0, 0]} isAnimationActive activeBar={false}>
-                  {comparisonData.map((d, i) => <Cell key={i} fill={i === 0 ? "#fbbf24" : "#60a5fa"} />)}
-                </Bar>
-              </BarChart>
+                <YAxis tick={{ fontSize: 10, fill: "#64748b" }} tickFormatter={(v) => fmtPLNShort(v)} width={48} />
+                <Tooltip
+                  cursor={{ stroke: "#475569" }}
+                  labelFormatter={(d) => new Date(d).toLocaleDateString("pl-PL")}
+                  formatter={(v) => fmtPLN(v)}
+                  contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
+                  itemStyle={{ color: "#e2e8f0" }}
+                  labelStyle={{ color: "#94a3b8", marginBottom: 4 }}
+                />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Line type="monotone" dataKey="Twój portfel" stroke={seriesColors[0]} strokeWidth={2.5} dot={false} isAnimationActive />
+                {selectedBenchmarks.map((key, i) => {
+                  const label = BENCHMARKS.find((b) => b.key === key).label;
+                  return (
+                    <Line
+                      key={key}
+                      type="monotone"
+                      dataKey={label}
+                      stroke={seriesColors[(i + 1) % seriesColors.length]}
+                      strokeWidth={2}
+                      dot={false}
+                      isAnimationActive
+                      connectNulls
+                    />
+                  );
+                })}
+              </ComposedChart>
             </ResponsiveContainer>
           </div>
         )}
         <p className="text-xs text-slate-600 mt-3">
-          Zwrot od najwcześniejszej transakcji do dziś. Wymaga zewnętrznych danych giełdowych (Yahoo Finance) — w środowisku Claude może się nie udać z powodu ograniczeń sieciowych.
+          Wartość portfela (kapitał od transakcji, na koniec realna wycena) vs symulacja "gdyby te same wpłaty trafiły w benchmark". Wymaga zewnętrznych danych giełdowych (Yahoo Finance) — w środowisku Claude może się nie udać z powodu ograniczeń sieciowych.
         </p>
       </div>
     </div>
@@ -1807,10 +1970,17 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
           if (!cancelled) setHistorySeries(rows.map((r) => ({ t: r.t, price: r.close })));
         } else {
           const tf = TIMEFRAMES.find((t) => t.key === timeframe);
-          const rangeMap = { "1m": "1mo", "6m": "6mo", "1r": "1y", "5l": "5y", max: "max" };
-          const yahooRange = rangeMap[timeframe] || "3mo";
+          const rangeIntervalMap = {
+            "1t": { range: "5d", interval: "30m" },
+            "1m": { range: "1mo", interval: "1d" },
+            "6m": { range: "6mo", interval: "1d" },
+            "1r": { range: "1y", interval: "1d" },
+            "5l": { range: "5y", interval: "1wk" },
+            max: { range: "max", interval: "1mo" },
+          };
+          const cfg = rangeIntervalMap[timeframe] || { range: "3mo", interval: "1d" };
           const yahooSymbol = toYahooSymbol(ticker);
-          const rows = await fetchYahooSeries(yahooSymbol, yahooRange);
+          const rows = await fetchYahooSeries(yahooSymbol, cfg.range, cfg.interval);
           if (!cancelled) setHistorySeries(rows.map((r) => ({ t: new Date(r.date).getTime(), price: r.close })));
         }
       } catch (e) {
@@ -1846,30 +2016,74 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
 
         <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4 mb-4">
           <p className="text-2xl tabular-nums tracking-tight font-bold tracking-tight mb-1">{fmtPLN(currentPrice)}</p>
-          {chartData.length > 1 && (
-            <div style={{ height: 180 }} className="mt-2">
-              <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={chartData} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
-                  <XAxis
-                    dataKey="t"
-                    type="number"
-                    domain={["dataMin", "dataMax"]}
-                    tickFormatter={(t) => new Date(t).toLocaleDateString("pl-PL", { month: "short", day: "numeric" })}
-                    tick={{ fontSize: 10, fill: "#64748b" }}
-                  />
-                  <YAxis hide domain={["auto", "auto"]} />
-                  <Tooltip
-                    cursor={{ stroke: "#334155" }}
-                    labelFormatter={(t) => new Date(t).toLocaleDateString("pl-PL")}
-                    formatter={(v) => fmtPLN(v)}
-                    contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
-                    itemStyle={{ color: "#e2e8f0" }}
-                    labelStyle={{ color: "#94a3b8" }}
-                  />
-                  <Line type="monotone" dataKey="price" stroke="#fbbf24" strokeWidth={2} dot={usingOwnData} isAnimationActive activeDot={{ r: 4 }} />
-                  <Scatter
-                    data={txPoints}
-                    dataKey="price"
+          {chartData.length > 1 && (() => {
+            const periodStart = chartData[0].price;
+            const periodEnd = chartData[chartData.length - 1].price;
+            const periodChange = periodEnd - periodStart;
+            const periodChangePct = periodStart ? (periodChange / periodStart) * 100 : 0;
+            const trendUp = periodChange >= 0;
+            const chartColor = trendUp ? "#34d399" : "#f87171";
+            const tfLabel = TIMEFRAMES.find((t) => t.key === timeframe)?.label || "";
+            return (
+              <>
+                <p className={`text-sm font-semibold mb-2 ${trendUp ? "text-emerald-400" : "text-rose-400"}`}>
+                  {trendUp ? "+" : ""}{fmtPLN(periodChange)} · {trendUp ? "+" : ""}{periodChangePct.toFixed(2)}% · {tfLabel}
+                </p>
+                <div style={{ height: 180 }} className="mt-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={chartData} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
+                      <defs>
+                        <linearGradient id="priceGradient" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor={chartColor} stopOpacity={0.4} />
+                          <stop offset="100%" stopColor={chartColor} stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="t"
+                        type="number"
+                        domain={["dataMin", "dataMax"]}
+                        tickFormatter={(t) =>
+                          timeframe === "1d" || timeframe === "1t"
+                            ? new Date(t).toLocaleDateString("pl-PL", { day: "numeric", month: "short" })
+                            : new Date(t).toLocaleDateString("pl-PL", { month: "short", day: "numeric" })
+                        }
+                        tick={{ fontSize: 10, fill: "#64748b" }}
+                        axisLine={{ stroke: "#1e293b" }}
+                        tickLine={false}
+                      />
+                      <YAxis hide domain={["auto", "auto"]} />
+                      <Tooltip
+                        cursor={{ stroke: "#475569", strokeWidth: 1 }}
+                        content={({ active, payload, label }) => {
+                          if (!active || !payload || !payload.length) return null;
+                          const entry = payload.find((p) => p.name !== "marker") || payload[0];
+                          return (
+                            <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12, padding: "6px 10px" }}>
+                              <div style={{ color: "#94a3b8", marginBottom: 2 }}>
+                                {new Date(label).toLocaleDateString("pl-PL", { day: "numeric", month: "short", year: "numeric" })}
+                                {(timeframe === "1d" || timeframe === "1t") &&
+                                  " · " + new Date(label).toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}
+                              </div>
+                              <div style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmtPLN(entry.value)}</div>
+                            </div>
+                          );
+                        }}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="price"
+                        stroke={chartColor}
+                        strokeWidth={2.5}
+                        fill="url(#priceGradient)"
+                        dot={false}
+                        isAnimationActive
+                        activeDot={{ r: 4, fill: chartColor, stroke: "#0f172a", strokeWidth: 2 }}
+                      />
+                      <Scatter
+                        name="marker"
+                        data={txPoints}
+                        dataKey="price"
                     shape={(p) => {
                       const isBuy = p.payload.type === "buy";
                       return (
@@ -1887,7 +2101,9 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
-          )}
+              </>
+            );
+          })()}
           <div className="flex items-center gap-1.5 mt-3">
             {TIMEFRAMES.map((tf) => (
               <button
@@ -1908,7 +2124,7 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
             <p className="text-xs text-slate-600 mt-2">
               {timeframe === "1d" && historyError && historyError.includes("klucza API")
                 ? historyError
-                : "Pełna historia kursu niedostępna (ograniczenia sieciowe środowiska Claude) — wykres pokazuje Twoje własne transakcje."}
+                : "Pełna historia notowań chwilowo niedostępna — wykres pokazuje Twoje własne transakcje."}
             </p>
           )}
         </div>
@@ -2156,6 +2372,45 @@ function isXtbWorkbook(wb) {
   return names.includes("closed positions") || names.includes("open positions");
 }
 
+function parsePLNumber(raw) {
+  const cleaned = String(raw).replace(/[\s\u00a0]/g, "").replace(",", ".");
+  const n = parseFloat(cleaned);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function detectIngMaklerskiCsv(text) {
+  const firstLines = text.split(/\r?\n/).filter((l) => l.trim()).slice(0, 5);
+  if (!firstLines.length) return false;
+  let matches = 0;
+  for (const line of firstLines) {
+    const cols = line.split(";");
+    if (cols.length === 9 && /^\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2}$/.test(cols[0].trim())) {
+      matches++;
+    }
+  }
+  return matches === firstLines.length;
+}
+
+function parseIngMaklerskiCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  const txs = [];
+  for (const line of lines) {
+    const cols = line.split(";");
+    if (cols.length !== 9) continue;
+    const [dateRaw, , tickerRaw, typeRaw, qtyRaw, priceRaw] = cols;
+    const [d, m, y] = dateRaw.split(" ")[0].split("-");
+    const time = dateRaw.split(" ")[1] || "00:00:00";
+    const date = `${y}-${m}-${d}T${time}`;
+    const ticker = tickerRaw.trim().toUpperCase() + ".PL";
+    const type = typeRaw.trim().toLowerCase() === "kupno" ? "buy" : "sell";
+    const quantity = parsePLNumber(qtyRaw);
+    const price = parsePLNumber(priceRaw);
+    if (!ticker || !Number.isFinite(quantity) || !Number.isFinite(price)) continue;
+    txs.push({ ticker, name: ticker.replace(/\.PL$/, ""), type, quantity, price, currency: "PLN", date });
+  }
+  return txs;
+}
+
 function parseXtbWorkbook(wb) {
   const txs = [];
   const warnings = [];
@@ -2259,13 +2514,26 @@ function ImportModal({ portfolios, onAddPortfolio, onClose, onImport }) {
     const reader = new FileReader();
     if (ext === "csv") {
       reader.onload = (ev) => {
-        const result = Papa.parse(ev.target.result, { header: true, skipEmptyLines: true });
+        const buf = ev.target.result;
+        let text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+        if (text.includes("\ufffd")) {
+          text = new TextDecoder("windows-1250", { fatal: false }).decode(buf);
+        }
+        if (detectIngMaklerskiCsv(text)) {
+          const txs = parseIngMaklerskiCsv(text);
+          if (txs.length) {
+            setAutoTxs(txs);
+            setColumns(["__auto__"]);
+            return;
+          }
+        }
+        const result = Papa.parse(text, { header: true, skipEmptyLines: true });
         const cols = result.meta.fields || [];
         setColumns(cols);
         setRows(result.data);
         setMapping(guessMapping(cols));
       };
-      reader.readAsText(file, "UTF-8");
+      reader.readAsArrayBuffer(file);
     } else if (ext === "xlsx" || ext === "xls") {
       reader.onload = (ev) => {
         try {
