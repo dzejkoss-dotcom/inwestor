@@ -1604,6 +1604,7 @@ function StatystykiTab({ transactions, portfolios, prices }) {
   const [benchmarkResults, setBenchmarkResults] = useState({});
   const [benchmarkSeries, setBenchmarkSeries] = useState([]);
   const [loadingBenchmarks, setLoadingBenchmarks] = useState(false);
+  const [benchmarkTimeframe, setBenchmarkTimeframe] = useState("max");
   const [benchmarkError, setBenchmarkError] = useState("");
 
   const filteredTransactions = useMemo(() => {
@@ -1707,18 +1708,25 @@ function StatystykiTab({ transactions, portfolios, prices }) {
 
     const dates = [...sortedTxs.map((t) => t.date), now.toISOString()];
     const merged = dates.map((date, i) => {
-      const point = { date, "Twój portfel": portfolioSeries[i] };
+      const point = { t: new Date(date).getTime(), "Twój portfel": portfolioSeries[i] };
       for (const key of selectedBenchmarks) {
         if (series[key]) point[BENCHMARKS.find((b) => b.key === key).label] = series[key][i];
       }
       return point;
-    });
+    }).sort((a, b) => a.t - b.t);
 
     setBenchmarkSeries(merged);
     setBenchmarkResults(series);
     if (Object.keys(series).length === 0 && anyError) setBenchmarkError(anyError);
     setLoadingBenchmarks(false);
   }
+
+  const visibleBenchmarkSeries = useMemo(() => {
+    const tf = TIMEFRAMES.find((t) => t.key === benchmarkTimeframe);
+    if (!tf || !tf.days) return benchmarkSeries;
+    const cutoff = Date.now() - tf.days * 24 * 60 * 60 * 1000;
+    return benchmarkSeries.filter((p) => p.t >= cutoff);
+  }, [benchmarkSeries, benchmarkTimeframe]);
 
   const seriesColors = ["#fbbf24", "#60a5fa", "#34d399", "#f472b6", "#a78bfa", "#fb923c"];
   const noHighlightCursor = { fill: "transparent" };
@@ -1846,13 +1854,30 @@ function StatystykiTab({ transactions, portfolios, prices }) {
         )}
 
         {benchmarkSeries.length > 1 && (
+          <div className="flex gap-1.5 mb-3 flex-wrap">
+            {TIMEFRAMES.map((tf) => (
+              <button
+                key={tf.key}
+                onClick={() => setBenchmarkTimeframe(tf.key)}
+                className={`px-2.5 py-1 rounded-full text-xs font-semibold transition-colors ${
+                  benchmarkTimeframe === tf.key ? "bg-amber-400 text-slate-950" : "bg-slate-800 text-slate-400"
+                }`}
+              >
+                {tf.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {benchmarkSeries.length > 1 && (
           <div style={{ height: 220 }}>
             <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={benchmarkSeries} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
+              <ComposedChart data={visibleBenchmarkSeries} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
                 <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
                 <XAxis
-                  dataKey="date"
-                  tickFormatter={(d) => new Date(d).toLocaleDateString("pl-PL", { month: "short", year: "2-digit" })}
+                  dataKey="t"
+                  type="number"
+                  domain={["dataMin", "dataMax"]}
+                  tickFormatter={(t) => new Date(t).toLocaleDateString("pl-PL", { month: "short", year: "2-digit" })}
                   tick={{ fontSize: 10, fill: "#64748b" }}
                   axisLine={{ stroke: "#1e293b" }}
                   tickLine={false}
@@ -1861,14 +1886,14 @@ function StatystykiTab({ transactions, portfolios, prices }) {
                 <YAxis tick={{ fontSize: 10, fill: "#64748b" }} tickFormatter={(v) => fmtPLNShort(v)} width={48} />
                 <Tooltip
                   cursor={{ stroke: "#475569" }}
-                  labelFormatter={(d) => new Date(d).toLocaleDateString("pl-PL")}
+                  labelFormatter={(t) => new Date(t).toLocaleDateString("pl-PL")}
                   formatter={(v) => fmtPLN(v)}
                   contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
                   itemStyle={{ color: "#e2e8f0" }}
                   labelStyle={{ color: "#94a3b8", marginBottom: 4 }}
                 />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Line type="monotone" dataKey="Twój portfel" stroke={seriesColors[0]} strokeWidth={2.5} dot={false} isAnimationActive />
+                <Line type="monotone" dataKey="Twój portfel" stroke={seriesColors[0]} strokeWidth={2.5} dot={false} isAnimationActive connectNulls />
                 {selectedBenchmarks.map((key, i) => {
                   const label = BENCHMARKS.find((b) => b.key === key).label;
                   return (
@@ -1994,6 +2019,23 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
   const txPointsAll = tickerTx.map((t) => ({ t: new Date(t.date).getTime(), price: Number(t.price), type: t.type }));
   const cutoffMs = cutoffDate.getTime();
   const txPoints = txPointsAll.filter((p) => p.t >= cutoffMs);
+  const txPointsGrouped = useMemo(() => {
+    const byDay = {};
+    for (const p of txPoints) {
+      const dayKey = new Date(p.t).toISOString().slice(0, 10);
+      if (!byDay[dayKey]) byDay[dayKey] = { t: p.t, buyQty: 0, sellQty: 0, priceSum: 0, count: 0 };
+      const g = byDay[dayKey];
+      g.priceSum += p.price;
+      g.count += 1;
+      if (p.type === "buy") g.buyQty += 1; else g.sellQty += 1;
+    }
+    return Object.values(byDay).map((g) => ({
+      t: g.t,
+      price: g.priceSum / g.count,
+      type: g.buyQty >= g.sellQty ? "buy" : "sell",
+      mixed: g.buyQty > 0 && g.sellQty > 0,
+    }));
+  }, [txPoints]);
 
   const historyInRange = historySeries ? historySeries.filter((p) => p.t >= cutoffMs) : null;
   const chartData = historyInRange && historyInRange.length > 1 ? historyInRange : txPoints.map((p) => ({ t: p.t, price: p.price }));
@@ -2075,6 +2117,7 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
                         dataKey="price"
                         stroke={chartColor}
                         strokeWidth={2.5}
+                        strokeDasharray={usingOwnData ? "6 4" : undefined}
                         fill="url(#priceGradient)"
                         dot={false}
                         isAnimationActive
@@ -2082,7 +2125,7 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
                       />
                       <Scatter
                         name="marker"
-                        data={txPoints}
+                        data={txPointsGrouped}
                         dataKey="price"
                     shape={(p) => {
                       const isBuy = p.payload.type === "buy";
@@ -2090,10 +2133,11 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
                         <circle
                           cx={p.cx}
                           cy={p.cy}
-                          r={5}
+                          r={4}
                           fill={isBuy ? "#34d399" : "#f87171"}
+                          fillOpacity={0.85}
                           stroke="#0f172a"
-                          strokeWidth={2}
+                          strokeWidth={1.5}
                         />
                       );
                     }}
@@ -2121,10 +2165,13 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
             {loadingHistory && <span className="ml-auto">Ładuję historię…</span>}
           </div>
           {!loadingHistory && usingOwnData && (
-            <p className="text-xs text-slate-600 mt-2">
-              {historyError
-                ? `Pełna historia notowań niedostępna: ${historyError}`
-                : "Pełna historia notowań chwilowo niedostępna — wykres pokazuje Twoje własne transakcje."}
+            <p className="text-xs text-amber-500 mt-2 flex items-start gap-1">
+              <span>⚠</span>
+              <span>
+                {historyError
+                  ? `To NIE jest prawdziwy kurs giełdowy (linia przerywana) — pokazane są tylko Twoje transakcje. Powód: ${historyError}`
+                  : "To NIE jest prawdziwy kurs giełdowy (linia przerywana) — pokazane są tylko Twoje transakcje."}
+              </span>
             </p>
           )}
         </div>
