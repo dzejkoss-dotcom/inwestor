@@ -28,7 +28,7 @@ if (typeof window !== "undefined" && !window.storage) {
 import {
   PieChart, Pie, Cell, ResponsiveContainer, AreaChart, Area,
   XAxis, YAxis, Tooltip, CartesianGrid, BarChart, Bar, LabelList,
-  ComposedChart, Line, Scatter, Legend,
+  ComposedChart, Line, Scatter, Legend, ReferenceDot,
 } from "recharts";
 import {
   Plus, TrendingUp, TrendingDown, RefreshCw, X, Wallet,
@@ -87,6 +87,7 @@ const SEED_XTB_TRANSACTIONS = [
 const CURRENCIES = ["PLN", "USD", "EUR"];
 const STORAGE_KEY = "portfolio:transactions";
 const PORTFOLIOS_KEY = "portfolio:portfolios";
+const APP_VERSION = "v9";
 const PRICES_KEY = "portfolio:prices-cache";
 const DIVIDENDS_KEY = "portfolio:dividends-cache";
 const TWELVEDATA_KEY_STORAGE = "portfolio:twelvedata-api-key";
@@ -247,8 +248,8 @@ const BENCHMARKS = [
   { key: "wig", label: "WIG", symbol: "WIG.WA" },
   { key: "wig20", label: "WIG20", symbol: "WIG20.WA" },
   { key: "wig40", label: "WIG40 (mWIG40)", symbol: "MWIG40.WA" },
-  { key: "sp500", label: "S&P 500", symbol: "^GSPC" },
-  { key: "nasdaq100", label: "NASDAQ 100", symbol: "^NDX" },
+  { key: "sp500", label: "S&P 500", symbol: "^GSPC", currency: "USD" },
+  { key: "nasdaq100", label: "NASDAQ 100", symbol: "^NDX", currency: "USD" },
 ];
 
 function fmtPLN(n) {
@@ -329,6 +330,34 @@ function calculateXIRR(cashflows) {
 function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
+// ING Maklerski zapisuje spółki pełnymi nazwami, giełda i Yahoo używają skrótów.
+// Mapujemy nazwę z ING na ticker GPW, żeby kursy, dywidendy i łączenie pozycji działały.
+const TICKER_ALIASES = {
+  "CDPROJEKT.PL": { ticker: "CDR.PL", name: "CD Projekt RED" },
+  "DIA1.PL": { ticker: "DIAG.PL", name: "Diagnostyka" },
+  "DINOPL.PL": { ticker: "DNP.PL", name: "Dino Polska" },
+  "PKNORLEN.PL": { ticker: "PKN.PL", name: "Orlen" },
+  "AUTOPARTN.PL": { ticker: "APR.PL", name: "Auto Partner" },
+  "PKPCARGO.PL": { ticker: "PKP.PL", name: "PKP Cargo" },
+  "ZABKA.PL": { ticker: "ZAB.PL", name: "Żabka" },
+  "SYNEKTIK.PL": { ticker: "SNT.PL", name: "Synektik" },
+  "MOBRUK.PL": { ticker: "MBR.PL", name: "Mo-Bruk" },
+  "KRUK.PL": { ticker: "KRU.PL", name: "Kruk" },
+  "KGHM.PL": { ticker: "KGH.PL", name: "KGHM" },
+  "PEPCO.PL": { ticker: "PCO.PL", name: "Pepco" },
+  "BLOOBER.PL": { ticker: "BLO.PL", name: "Bloober Team" },
+  "VOXEL.PL": { ticker: "VOX.PL", name: "Voxel" },
+  "MODIVO.PL": { ticker: "CCC.PL", name: "Modivo" },
+  "DIAG.PL": { ticker: "DIAG.PL", name: "Diagnostyka" },
+};
+function normalizeTx(t) {
+  const alias = TICKER_ALIASES[String(t.ticker || "").toUpperCase().trim()];
+  if (!alias) return t;
+  const rawName = String(t.ticker).replace(/\.PL$/i, "");
+  const keepName = t.name && t.name.trim() && t.name.trim().toUpperCase() !== rawName.toUpperCase();
+  return { ...t, ticker: alias.ticker, name: keepName ? t.name : alias.name };
+}
+
 function txFingerprint(t) {
   const round = (n) => (Number.isFinite(Number(n)) ? Number(n).toFixed(6) : "0");
   return [t.portfolioId, t.ticker.toUpperCase().trim(), t.type, round(t.quantity), round(t.price), t.date].join("|");
@@ -670,7 +699,7 @@ export default function App() {
         window.storage.set(SEED_IKE_FLAG_KEY, "1", false).catch(() => {});
       }
 
-      const migrated = txRaw.map((tx) => {
+      const migrated = txRaw.map(normalizeTx).map((tx) => {
         if (tx.portfolioId) return tx;
         let pid = nameToId[tx.broker];
         if (!pid) {
@@ -788,15 +817,22 @@ export default function App() {
   const addTransactions = useCallback((txs) => {
     let skippedDuplicates = 0;
     setTransactions((prev) => {
-      const existingFingerprints = new Set(prev.map(txFingerprint));
+      // Liczymy wystąpienia, a nie samą obecność: dwie identyczne transakcje w pliku
+      // (np. dwie sprzedaże po 19 szt. w tej samej sekundzie) są prawdziwe i obie zostają.
+      // Przy ponownym imporcie tego samego pliku pomijamy tyle kopii, ile już istnieje.
+      const existingCounts = {};
+      for (const t of prev) {
+        const fp = txFingerprint(t);
+        existingCounts[fp] = (existingCounts[fp] || 0) + 1;
+      }
       const toAdd = [];
       for (const t of txs) {
         const fp = txFingerprint(t);
-        if (existingFingerprints.has(fp)) {
+        if (existingCounts[fp] > 0) {
+          existingCounts[fp]--;
           skippedDuplicates++;
           continue;
         }
-        existingFingerprints.add(fp);
         toAdd.push({ ...t, id: uid() });
       }
       return [...prev, ...toAdd];
@@ -1594,6 +1630,7 @@ function SettingsTab({ portfolios, transactions, onAdd, onRename, onDelete, twel
           </div>
         </div>
       )}
+      <p className="text-center text-[11px] text-slate-600 mt-8 mb-2">Mój portfel · wersja {APP_VERSION}</p>
     </div>
   );
 }
@@ -1601,8 +1638,8 @@ function SettingsTab({ portfolios, transactions, onAdd, onRename, onDelete, twel
 function StatystykiTab({ transactions, portfolios, prices }) {
   const [filterPortfolio, setFilterPortfolio] = useState("all");
   const [selectedBenchmarks, setSelectedBenchmarks] = useState([]);
-  const [benchmarkResults, setBenchmarkResults] = useState({});
-  const [benchmarkSeries, setBenchmarkSeries] = useState([]);
+  const [compData, setCompData] = useState(null);
+  const [compProgress, setCompProgress] = useState("");
   const [loadingBenchmarks, setLoadingBenchmarks] = useState(false);
   const [benchmarkTimeframe, setBenchmarkTimeframe] = useState("max");
   const [benchmarkError, setBenchmarkError] = useState("");
@@ -1660,73 +1697,169 @@ function StatystykiTab({ transactions, portfolios, prices }) {
     setSelectedBenchmarks((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   }
 
-  function priceOnOrBefore(rows, dateMs) {
-    let ans = rows[0]?.close;
-    for (const r of rows) {
-      if (new Date(r.date).getTime() <= dateMs) ans = r.close;
-      else break;
-    }
-    return ans;
+  // Zmiana filtra portfela unieważnia poprzednie porównanie
+  useEffect(() => { setCompData(null); setBenchmarkError(""); }, [filterPortfolio]);
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const dayKey = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+  function yahooRangeFor(firstMs) {
+    const years = (Date.now() - firstMs) / (365 * DAY_MS);
+    if (years <= 1.9) return "2y";
+    if (years <= 4.9) return "5y";
+    if (years <= 9.9) return "10y";
+    return "max";
   }
 
-  function simulateBenchmarkSeries(sortedTxs, benchRows, nowMs) {
-    let units = 0;
-    const points = [];
-    for (const t of sortedTxs) {
-      const dateMs = new Date(t.date).getTime();
-      const cash = (t.type === "buy" ? 1 : -1) * Number(t.quantity) * Number(t.price);
-      const price = priceOnOrBefore(benchRows, dateMs) || 1;
-      units += cash / price;
-      points.push(Math.max(units * price, 0));
+  // Seria notowań -> wartość na każdy dzień siatki (brak notowań w weekend = ostatnia znana cena)
+  function onGrid(days, rows) {
+    const byDay = {};
+    for (const r of rows) byDay[dayKey(new Date(r.date).getTime())] = r.close;
+    const out = new Array(days.length);
+    let last = null;
+    const firstKnown = rows.length ? rows[0].close : null;
+    for (let i = 0; i < days.length; i++) {
+      const v = byDay[dayKey(days[i])];
+      if (Number.isFinite(v)) last = v;
+      out[i] = last ?? firstKnown;
     }
-    const lastPrice = benchRows[benchRows.length - 1].close;
-    points.push(Math.max(units * lastPrice, 0));
-    return points;
+    return out;
+  }
+
+  async function mapLimit(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    async function worker() {
+      while (next < items.length) { const i = next++; results[i] = await fn(items[i], i); }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return results;
   }
 
   async function runComparison() {
-    if (!selectedBenchmarks.length || !filteredTransactions.length) return;
+    if (!filteredTransactions.length) return;
     setLoadingBenchmarks(true);
     setBenchmarkError("");
-    const sortedTxs = [...filteredTransactions].sort((a, b) => new Date(a.date) - new Date(b.date));
-    const now = new Date();
+    try {
+      const txs = [...filteredTransactions]
+        .map((t) => ({ ...t, ms: new Date(t.date).getTime() }))
+        .filter((t) => Number.isFinite(t.ms))
+        .sort((a, b) => a.ms - b.ms);
+      const firstDay = new Date(dayKey(txs[0].ms)).getTime();
+      const today = new Date(dayKey(Date.now())).getTime();
+      const days = [];
+      for (let d = firstDay; d <= today; d += DAY_MS) days.push(d);
+      const range = yahooRangeFor(firstDay);
 
-    const portfolioSeries = investedOverTime.map((p) => p.value);
-    portfolioSeries.push(localMetrics.currentValueTotal);
+      const tickers = [...new Set(txs.map((t) => t.ticker.toUpperCase()))];
+      const benchKeys = [...selectedBenchmarks];
+      const needFx = tickers.some((t) => t.endsWith(".US")) || benchKeys.some((k) => BENCHMARKS.find((b) => b.key === k)?.currency === "USD");
 
-    const series = {};
-    const errorsByBenchmark = {};
-    for (const key of selectedBenchmarks) {
-      const bench = BENCHMARKS.find((b) => b.key === key);
-      try {
-        const rows = await fetchYahooSeries(bench.symbol, "5y");
-        series[key] = simulateBenchmarkSeries(sortedTxs, rows, now.getTime());
-      } catch (e) {
-        errorsByBenchmark[key] = `${bench.label}: ${String(e.message || e)}`;
+      setCompProgress(`Pobieram notowania ${tickers.length} spółek…`);
+      const fxRows = needFx ? await fetchYahooSeries("PLN=X", range, "1d").catch(() => null) : null;
+      const fx = fxRows ? onGrid(days, fxRows) : null;
+      if (needFx && !fx) throw new Error("nie udało się pobrać kursu USD/PLN");
+
+      // Ceny spółek w PLN na każdy dzień. Gdy Yahoo nie zna spółki — ceny z Twoich transakcji.
+      const missing = [];
+      const priceByTicker = {};
+      await mapLimit(tickers, 6, async (tk) => {
+        const isUS = tk.endsWith(".US");
+        try {
+          const rows = await fetchYahooSeries(toYahooSymbol(tk), range, "1d");
+          const grid = onGrid(days, rows);
+          priceByTicker[tk] = isUS ? grid.map((v, i) => (v != null && fx[i] ? v * fx[i] : v)) : grid;
+        } catch (e) {
+          missing.push(tk.replace(/\.(PL|US|UK)$/, ""));
+          const own = txs.filter((t) => t.ticker.toUpperCase() === tk).map((t) => ({ date: new Date(t.ms).toISOString(), close: Number(t.price) }));
+          priceByTicker[tk] = onGrid(days, own); // ceny z transakcji są już w PLN
+        }
+      });
+
+      // Ilość posiadanych akcji i przepływy gotówki na każdy dzień
+      const qty = Object.fromEntries(tickers.map((t) => [t, 0]));
+      const flows = new Array(days.length).fill(0);
+      const port = new Array(days.length).fill(0);
+      let ti = 0;
+      for (let i = 0; i < days.length; i++) {
+        const dayEnd = days[i] + DAY_MS;
+        while (ti < txs.length && txs[ti].ms < dayEnd) {
+          const t = txs[ti++];
+          const q = Number(t.quantity) || 0, p = Number(t.price) || 0;
+          const k = t.ticker.toUpperCase();
+          qty[k] += t.type === "buy" ? q : -q;
+          if (qty[k] < 1e-9) qty[k] = 0;
+          flows[i] += t.type === "buy" ? q * p : -q * p;
+        }
+        let v = 0;
+        for (const k of tickers) {
+          if (!qty[k]) continue;
+          const isLast = i === days.length - 1;
+          const px = isLast && prices[k]?.price ? prices[k].price : priceByTicker[k][i];
+          if (px) v += qty[k] * px;
+        }
+        port[i] = v;
       }
+
+      // Indeksy w PLN
+      const bench = {};
+      const errors = [];
+      for (const key of benchKeys) {
+        const b = BENCHMARKS.find((x) => x.key === key);
+        try {
+          const rows = await fetchYahooSeries(b.symbol, range, "1d");
+          const grid = onGrid(days, rows);
+          bench[key] = b.currency === "USD" ? grid.map((v, i) => (v != null && fx[i] ? v * fx[i] : v)) : grid;
+        } catch (e) {
+          errors.push(`${b.label}: ${String(e.message || e)}`);
+        }
+      }
+
+      setCompData({ days, port, flows, bench, missing });
+      setBenchmarkError(errors.join(" · "));
+    } catch (e) {
+      setBenchmarkError(String(e.message || e));
     }
-
-    const dates = [...sortedTxs.map((t) => t.date), now.toISOString()];
-    const merged = dates.map((date, i) => {
-      const point = { t: new Date(date).getTime(), "Twój portfel": portfolioSeries[i] };
-      for (const key of selectedBenchmarks) {
-        if (series[key]) point[BENCHMARKS.find((b) => b.key === key).label] = series[key][i];
-      }
-      return point;
-    }).sort((a, b) => a.t - b.t);
-
-    setBenchmarkSeries(merged);
-    setBenchmarkResults(series);
-    setBenchmarkError(Object.values(errorsByBenchmark).join(" · "));
+    setCompProgress("");
     setLoadingBenchmarks(false);
   }
 
+  // Seria na wybrany okres. Indeksy startują z tą samą kwotą co portfel na początku okresu,
+  // potem dostają te same wpłaty/wypłaty co Ty — różnica linii = różnica w wynikach.
+  const benchLabel = (key) => BENCHMARKS.find((b) => b.key === key)?.label || key;
   const visibleBenchmarkSeries = useMemo(() => {
+    if (!compData) return [];
+    const { days, port, flows, bench } = compData;
     const tf = TIMEFRAMES.find((t) => t.key === benchmarkTimeframe);
-    if (!tf || !tf.days) return benchmarkSeries;
-    const cutoff = Date.now() - tf.days * 24 * 60 * 60 * 1000;
-    return benchmarkSeries.filter((p) => p.t >= cutoff);
-  }, [benchmarkSeries, benchmarkTimeframe]);
+    let start = 0;
+    if (tf && tf.days) {
+      const cutoff = Date.now() - tf.days * DAY_MS;
+      start = days.findIndex((d) => d >= cutoff);
+      if (start < 0) start = days.length - 1;
+    }
+    // Pomijam dni sprzed pierwszej posiadanej pozycji w oknie
+    while (start < days.length - 1 && port[start] === 0 && flows[start] === 0) start++;
+    const units = {};
+    for (const key of Object.keys(bench)) units[key] = bench[key][start] ? port[start] / bench[key][start] : 0;
+    const out = [];
+    for (let i = start; i < days.length; i++) {
+      if (i > start) {
+        for (const key of Object.keys(bench)) {
+          if (flows[i] && bench[key][i]) units[key] = Math.max(0, units[key] + flows[i] / bench[key][i]);
+        }
+      }
+      const pt = { t: days[i], "Twój portfel": Math.round(port[i] * 100) / 100 };
+      for (const key of Object.keys(bench)) {
+        if (bench[key][i] != null) pt[benchLabel(key)] = Math.round(units[key] * bench[key][i] * 100) / 100;
+      }
+      out.push(pt);
+    }
+    // Rzadziej punkty przy długich okresach, żeby wykres był płynny na telefonie
+    const maxPts = 300;
+    if (out.length <= maxPts) return out;
+    const step = Math.ceil(out.length / maxPts);
+    return out.filter((_, i) => i % step === 0 || i === out.length - 1);
+  }, [compData, benchmarkTimeframe]);
 
   const seriesColors = ["#fbbf24", "#60a5fa", "#34d399", "#f472b6", "#a78bfa", "#fb923c"];
   const noHighlightCursor = { fill: "transparent" };
@@ -1843,19 +1976,19 @@ function StatystykiTab({ transactions, portfolios, prices }) {
         </div>
         <button
           onClick={runComparison}
-          disabled={!selectedBenchmarks.length || loadingBenchmarks || !filteredTransactions.length}
+          disabled={loadingBenchmarks || !filteredTransactions.length}
           className="w-full py-2.5 rounded-xl bg-slate-800 text-slate-200 text-sm font-medium disabled:opacity-40 mb-3"
         >
-          {loadingBenchmarks ? "Porównuję…" : "Porównaj"}
+          {loadingBenchmarks ? (compProgress || "Porównuję…") : selectedBenchmarks.length ? "Porównaj" : "Pokaż wartość portfela"}
         </button>
 
         {benchmarkError && (
-          <p className="text-xs text-rose-400 mb-3">Nie udało się pobrać danych benchmarku: {benchmarkError}</p>
+          <p className="text-xs text-rose-400 mb-3">Nie udało się pobrać: {benchmarkError}</p>
         )}
 
-        {benchmarkSeries.length > 1 && (
+        {visibleBenchmarkSeries.length > 1 && (
           <div className="flex gap-1.5 mb-3 flex-wrap">
-            {TIMEFRAMES.map((tf) => (
+            {TIMEFRAMES.filter((tf) => tf.key !== "1d").map((tf) => (
               <button
                 key={tf.key}
                 onClick={() => setBenchmarkTimeframe(tf.key)}
@@ -1868,53 +2001,100 @@ function StatystykiTab({ transactions, portfolios, prices }) {
             ))}
           </div>
         )}
-        {benchmarkSeries.length > 1 && (
-          <div style={{ height: 220 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={visibleBenchmarkSeries} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
-                <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="t"
-                  type="number"
-                  domain={["dataMin", "dataMax"]}
-                  tickFormatter={(t) => new Date(t).toLocaleDateString("pl-PL", { month: "short", year: "2-digit" })}
-                  tick={{ fontSize: 10, fill: "#64748b" }}
-                  axisLine={{ stroke: "#1e293b" }}
-                  tickLine={false}
-                  minTickGap={30}
-                />
-                <YAxis tick={{ fontSize: 10, fill: "#64748b" }} tickFormatter={(v) => fmtPLNShort(v)} width={48} />
-                <Tooltip
-                  cursor={{ stroke: "#475569" }}
-                  labelFormatter={(t) => new Date(t).toLocaleDateString("pl-PL")}
-                  formatter={(v) => fmtPLN(v)}
-                  contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
-                  itemStyle={{ color: "#e2e8f0" }}
-                  labelStyle={{ color: "#94a3b8", marginBottom: 4 }}
-                />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Line type="monotone" dataKey="Twój portfel" stroke={seriesColors[0]} strokeWidth={2.5} dot={false} isAnimationActive connectNulls />
-                {selectedBenchmarks.map((key, i) => {
-                  const label = BENCHMARKS.find((b) => b.key === key).label;
-                  return (
-                    <Line
-                      key={key}
-                      type="monotone"
-                      dataKey={label}
-                      stroke={seriesColors[(i + 1) % seriesColors.length]}
-                      strokeWidth={2}
-                      dot={false}
-                      isAnimationActive
-                      connectNulls
+        {visibleBenchmarkSeries.length > 1 && (() => {
+          const tfDays = TIMEFRAMES.find((t) => t.key === benchmarkTimeframe)?.days;
+          const shortRange = tfDays && tfDays <= 31;
+          const benchKeys = Object.keys(compData.bench);
+          const last = visibleBenchmarkSeries[visibleBenchmarkSeries.length - 1];
+          const portEnd = last["Twój portfel"];
+          return (
+            <>
+              <div style={{ height: 230 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={visibleBenchmarkSeries} margin={{ left: 0, right: 0, top: 8, bottom: 0 }}>
+                    <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
+                    <XAxis
+                      dataKey="t"
+                      type="number"
+                      scale="time"
+                      domain={["dataMin", "dataMax"]}
+                      tickFormatter={(t) =>
+                        shortRange
+                          ? new Date(t).toLocaleDateString("pl-PL", { day: "numeric", month: "short" })
+                          : new Date(t).toLocaleDateString("pl-PL", { month: "short", year: "2-digit" })
+                      }
+                      tick={{ fontSize: 10, fill: "#64748b" }}
+                      axisLine={{ stroke: "#1e293b" }}
+                      tickLine={false}
+                      minTickGap={40}
                     />
+                    <YAxis
+                      orientation="right"
+                      domain={["auto", "auto"]}
+                      tick={{ fontSize: 10, fill: "#64748b" }}
+                      tickFormatter={(v) => fmtPLNShort(v)}
+                      axisLine={false}
+                      tickLine={false}
+                      width={40}
+                    />
+                    <Tooltip
+                      cursor={{ stroke: "#475569", strokeDasharray: "3 3" }}
+                      labelFormatter={(t) => new Date(t).toLocaleDateString("pl-PL", { day: "numeric", month: "short", year: "numeric" })}
+                      formatter={(v) => fmtPLN(v)}
+                      contentStyle={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12 }}
+                      itemStyle={{ color: "#e2e8f0" }}
+                      labelStyle={{ color: "#94a3b8", marginBottom: 4 }}
+                    />
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                    <Line type="linear" dataKey="Twój portfel" stroke={seriesColors[0]} strokeWidth={2.5} dot={false} isAnimationActive connectNulls />
+                    {benchKeys.map((key, i) => (
+                      <Line
+                        key={key}
+                        type="linear"
+                        dataKey={benchLabel(key)}
+                        stroke={seriesColors[(i + 1) % seriesColors.length]}
+                        strokeWidth={1.5}
+                        dot={false}
+                        isAnimationActive
+                        connectNulls
+                      />
+                    ))}
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div className="mt-3 space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-amber-400 font-semibold">Twój portfel</span>
+                  <span className="tabular-nums text-slate-200 font-semibold">{fmtPLN(portEnd)}</span>
+                </div>
+                {benchKeys.map((key) => {
+                  const v = last[benchLabel(key)];
+                  if (v == null) return null;
+                  const diff = portEnd - v;
+                  return (
+                    <div key={key} className="flex justify-between text-xs">
+                      <span className="text-slate-400">{benchLabel(key)}</span>
+                      <span className="tabular-nums text-slate-300">
+                        {fmtPLN(v)}{" "}
+                        <span className={diff >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                          ({diff >= 0 ? "Ty lepiej o " : "Ty gorzej o "}{fmtPLN(Math.abs(diff))})
+                        </span>
+                      </span>
+                    </div>
                   );
                 })}
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
+              </div>
+            </>
+          );
+        })()}
+        {compData?.missing?.length > 0 && (
+          <p className="text-[11px] text-slate-500 mt-3">
+            Bez notowań w Yahoo (użyto cen z Twoich transakcji): {compData.missing.join(", ")}
+          </p>
         )}
         <p className="text-xs text-slate-600 mt-3">
-          Wartość portfela (kapitał od transakcji, na koniec realna wycena) vs symulacja "gdyby te same wpłaty trafiły w benchmark". Wymaga zewnętrznych danych giełdowych (Yahoo Finance) — w środowisku Claude może się nie udać z powodu ograniczeń sieciowych.
+          Żółta linia to rzeczywista wartość Twoich akcji każdego dnia. Indeks pokazuje, ile byłoby warte, gdybyś w tych samych dniach wpłacał i wypłacał te same kwoty do indeksu zamiast do spółek. Na początku wybranego okresu obie linie startują z tej samej kwoty. Indeksy z USA przeliczone na złote.
         </p>
       </div>
     </div>
@@ -1972,15 +2152,16 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
   const category = CATEGORY_MAP[ticker.toUpperCase()] || "Inne";
   const portfolioNames = holdingInfo.portfolioIds.map((id) => portfolios.find((p) => p.id === id)?.name).filter(Boolean);
 
-  const cutoffDate = useMemo(() => {
-    const tf = TIMEFRAMES.find((t) => t.key === timeframe);
-    if (!tf || !tf.days) {
-      return tickerTx.length ? new Date(tickerTx[0].date) : new Date(0);
-    }
-    return new Date(Date.now() - tf.days * 24 * 60 * 60 * 1000);
-  }, [timeframe, tickerTx]);
-
-  const [historyDebug, setHistoryDebug] = useState("");
+  // Każdy okres pobiera od razu właściwy zakres z Yahoo — bez dodatkowego przycinania.
+  const CHART_CFG = {
+    "1d": { range: "1d", interval: "5m" },
+    "1t": { range: "5d", interval: "15m" },
+    "1m": { range: "1mo", interval: "1d" },
+    "6m": { range: "6mo", interval: "1d" },
+    "1r": { range: "1y", interval: "1d" },
+    "5l": { range: "5y", interval: "1wk" },
+    max: { range: "max", interval: "1mo" },
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -1988,65 +2169,79 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
       setLoadingHistory(true);
       setHistoryError("");
       try {
-        if (timeframe === "1d") {
-          if (!twelveDataKey) throw new Error("Widok 1D wymaga klucza API Twelve Data (Ustawienia)");
-          const isPL = ticker.toUpperCase().endsWith(".PL");
-          const isUS = ticker.toUpperCase().endsWith(".US");
-          const bareSymbol = ticker.replace(/\.(US|PL)$/i, "");
-          const rows = await fetchTwelveDataIntraday(bareSymbol, isPL ? "XWAR" : null, twelveDataKey);
-          if (!cancelled) {
-            setHistorySeries(rows.map((r) => ({ t: r.t, price: r.close })));
-            setHistoryDebug(`Twelve Data ${bareSymbol} · ${rows.length} pkt`);
-          }
+        const cfg = CHART_CFG[timeframe] || CHART_CFG["1r"];
+        const isUS = ticker.toUpperCase().endsWith(".US");
+        const fxRange = cfg.range === "1d" || cfg.range === "5d" ? "1mo" : cfg.range;
+        const fxInterval = cfg.interval.endsWith("m") ? "1d" : cfg.interval;
+        const [rows, fxRows] = await Promise.all([
+          fetchYahooSeries(toYahooSymbol(ticker), cfg.range, cfg.interval),
+          isUS ? fetchYahooSeries("PLN=X", fxRange, fxInterval).catch(() => null) : Promise.resolve(null),
+        ]);
+        let series = rows.map((r) => ({ t: new Date(r.date).getTime(), native: r.close }));
+        if (isUS) {
+          // Spółki z USA: Yahoo podaje dolary, przeliczamy na złote kursem z danego dnia.
+          const fx = (fxRows || []).map((r) => ({ t: new Date(r.date).getTime(), rate: r.close })).sort((a, b) => a.t - b.t);
+          const fallbackRate = fx.length ? fx[fx.length - 1].rate : null;
+          let i = 0;
+          series = series.map((p) => {
+            while (i + 1 < fx.length && fx[i + 1].t <= p.t) i++;
+            const rate = fx.length ? (fx[i].t <= p.t ? fx[i].rate : fx[0].rate) : fallbackRate;
+            return { t: p.t, price: rate ? p.native * rate : p.native };
+          });
+          if (!fx.length) throw new Error("brak kursu USD/PLN do przeliczenia");
         } else {
-          const rangeIntervalMap = {
-            "1t": { range: "1mo", interval: "1d" },
-            "1m": { range: "3mo", interval: "1d" },
-            "6m": { range: "6mo", interval: "1d" },
-            "1r": { range: "1y", interval: "1d" },
-            "5l": { range: "5y", interval: "1d" },
-            max: { range: "max", interval: "1wk" },
-          };
-          const cfg = rangeIntervalMap[timeframe] || { range: "3mo", interval: "1d" };
-          const yahooSymbol = toYahooSymbol(ticker);
-          const rows = await fetchYahooSeries(yahooSymbol, cfg.range, cfg.interval);
-          if (!cancelled) {
-            setHistorySeries(rows.map((r) => ({ t: new Date(r.date).getTime(), price: r.close })));
-            setHistoryDebug(`Yahoo ${yahooSymbol} (${cfg.range}/${cfg.interval}) · ${rows.length} pkt`);
-          }
+          series = series.map((p) => ({ t: p.t, price: p.native }));
         }
+        if (!cancelled) setHistorySeries(series);
       } catch (e) {
-        if (!cancelled) { setHistoryError(String(e.message || e)); setHistorySeries(null); setHistoryDebug(""); }
+        if (!cancelled) { setHistoryError(String(e.message || e)); setHistorySeries(null); }
       }
       if (!cancelled) setLoadingHistory(false);
     })();
     return () => { cancelled = true; };
-  }, [ticker, timeframe, twelveDataKey]);
+  }, [ticker, timeframe]);
 
-  const txPointsAll = tickerTx.map((t) => ({ t: new Date(t.date).getTime(), price: Number(t.price), type: t.type }));
-  const cutoffMs = cutoffDate.getTime();
-  const txPoints = txPointsAll.filter((p) => p.t >= cutoffMs);
-  const txPointsGrouped = useMemo(() => {
-    const byDay = {};
-    for (const p of txPoints) {
-      const dayKey = new Date(p.t).toISOString().slice(0, 10);
-      if (!byDay[dayKey]) byDay[dayKey] = { t: p.t, buyQty: 0, sellQty: 0, priceSum: 0, count: 0 };
-      const g = byDay[dayKey];
-      g.priceSum += p.price;
-      g.count += 1;
-      if (p.type === "buy") g.buyQty += 1; else g.sellQty += 1;
+  const chartData = useMemo(() => historySeries || [], [historySeries]);
+
+  // Znaczniki TYLKO dla Twoich transakcji: grupujemy po dniu i typie,
+  // przypinamy do najbliższego punktu notowań, żeby kropka leżała na linii.
+  const markers = useMemo(() => {
+    if (chartData.length < 2) return [];
+    const dayMs = 24 * 60 * 60 * 1000;
+    const first = chartData[0].t, last = chartData[chartData.length - 1].t;
+    const groups = {};
+    for (const t of tickerTx) {
+      const ms = new Date(t.date).getTime();
+      if (!Number.isFinite(ms) || ms < first - dayMs || ms > last + dayMs) continue;
+      const key = new Date(ms).toISOString().slice(0, 10) + "|" + t.type;
+      if (!groups[key]) groups[key] = { ms, type: t.type, qty: 0, value: 0, count: 0 };
+      const q = Number(t.quantity) || 0;
+      groups[key].qty += q;
+      groups[key].value += q * (Number(t.price) || 0);
+      groups[key].count += 1;
     }
-    return Object.values(byDay).map((g) => ({
-      t: g.t,
-      price: g.priceSum / g.count,
-      type: g.buyQty >= g.sellQty ? "buy" : "sell",
-      mixed: g.buyQty > 0 && g.sellQty > 0,
-    }));
-  }, [txPoints]);
+    return Object.values(groups).map((g) => {
+      let best = chartData[0];
+      for (const p of chartData) if (Math.abs(p.t - g.ms) < Math.abs(best.t - g.ms)) best = p;
+      return { ...g, x: best.t, y: best.price, avgPrice: g.qty ? g.value / g.qty : 0 };
+    });
+  }, [chartData, tickerTx]);
 
-  const historyInRange = historySeries ? historySeries.filter((p) => p.t >= cutoffMs) : null;
-  const chartData = historyInRange && historyInRange.length > 1 ? historyInRange : txPoints.map((p) => ({ t: p.t, price: p.price }));
-  const usingOwnData = !(historyInRange && historyInRange.length > 1);
+  const markersByX = useMemo(() => {
+    const m = {};
+    for (const mk of markers) (m[mk.x] = m[mk.x] || []).push(mk);
+    return m;
+  }, [markers]);
+
+  const fmtAxisPrice = (v) =>
+    new Intl.NumberFormat("pl-PL", { maximumFractionDigits: v >= 100 ? 0 : 2 }).format(v);
+  const fmtAxisTime = (t) => {
+    const d = new Date(t);
+    if (timeframe === "1d") return d.toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" });
+    if (timeframe === "1t" || timeframe === "1m" || timeframe === "6m") return d.toLocaleDateString("pl-PL", { day: "numeric", month: "short" });
+    if (timeframe === "1r") return d.toLocaleDateString("pl-PL", { month: "short" });
+    return d.toLocaleDateString("pl-PL", { month: "short", year: "2-digit" });
+  };
 
   return (
     <div className="min-h-full w-full bg-slate-950 text-slate-100 font-sans">
@@ -2065,12 +2260,10 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
 
         <div className="rounded-2xl bg-slate-900 border border-slate-800 p-4 mb-4">
           <p className="text-2xl tabular-nums tracking-tight font-bold tracking-tight mb-1">{fmtPLN(currentPrice)}</p>
-          <p className="text-[10px] text-slate-600 mb-1">
-            {loadingHistory ? "Ładuję…" : historyDebug ? `✓ ${historyDebug}` : historyError ? `✗ ${historyError}` : ""}
-          </p>
-          {chartData.length > 1 && (() => {
-            const periodStart = chartData[0].price;
-            const periodEnd = chartData[chartData.length - 1].price;
+          {(() => {
+            const hasData = chartData.length > 1;
+            const periodStart = hasData ? chartData[0].price : 0;
+            const periodEnd = hasData ? chartData[chartData.length - 1].price : 0;
             const periodChange = periodEnd - periodStart;
             const periodChangePct = periodStart ? (periodChange / periodStart) * 100 : 0;
             const trendUp = periodChange >= 0;
@@ -2078,87 +2271,103 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
             const tfLabel = TIMEFRAMES.find((t) => t.key === timeframe)?.label || "";
             return (
               <>
-                <p className={`text-sm font-semibold mb-2 ${trendUp ? "text-emerald-400" : "text-rose-400"}`}>
-                  {trendUp ? "+" : ""}{fmtPLN(periodChange)} · {trendUp ? "+" : ""}{periodChangePct.toFixed(2)}% · {tfLabel}
+                <p className={`text-sm font-semibold mb-2 h-5 tabular-nums ${hasData ? (trendUp ? "text-emerald-400" : "text-rose-400") : "text-slate-600"}`}>
+                  {hasData && !loadingHistory
+                    ? `${trendUp ? "+" : ""}${fmtPLN(periodChange)} · ${trendUp ? "+" : ""}${periodChangePct.toFixed(2)}% · ${tfLabel}`
+                    : ""}
                 </p>
-                <div style={{ height: 180 }} className="mt-2">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <ComposedChart data={chartData} margin={{ left: 0, right: 8, top: 8, bottom: 0 }}>
-                      <defs>
-                        <linearGradient id="priceGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor={chartColor} stopOpacity={0.4} />
-                          <stop offset="100%" stopColor={chartColor} stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
-                      <XAxis
-                        dataKey="t"
-                        type="number"
-                        domain={["dataMin", "dataMax"]}
-                        tickFormatter={(t) =>
-                          timeframe === "1d" || timeframe === "1t"
-                            ? new Date(t).toLocaleDateString("pl-PL", { day: "numeric", month: "short" })
-                            : new Date(t).toLocaleDateString("pl-PL", { month: "short", day: "numeric" })
-                        }
-                        tick={{ fontSize: 10, fill: "#64748b" }}
-                        axisLine={{ stroke: "#1e293b" }}
-                        tickLine={false}
-                      />
-                      <YAxis hide domain={["auto", "auto"]} />
-                      <Tooltip
-                        cursor={{ stroke: "#475569", strokeWidth: 1 }}
-                        content={({ active, payload, label }) => {
-                          if (!active || !payload || !payload.length) return null;
-                          const entry = payload.find((p) => p.name !== "marker") || payload[0];
-                          return (
-                            <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12, padding: "6px 10px" }}>
-                              <div style={{ color: "#94a3b8", marginBottom: 2 }}>
-                                {new Date(label).toLocaleDateString("pl-PL", { day: "numeric", month: "short", year: "numeric" })}
-                                {(timeframe === "1d" || timeframe === "1t") &&
-                                  " · " + new Date(label).toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}
-                              </div>
-                              <div style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmtPLN(entry.value)}</div>
-                            </div>
-                          );
-                        }}
-                      />
-                      <Area
-                        type="monotone"
-                        dataKey="price"
-                        stroke={chartColor}
-                        strokeWidth={2.5}
-                        strokeDasharray={usingOwnData ? "6 4" : undefined}
-                        fill="url(#priceGradient)"
-                        dot={false}
-                        isAnimationActive
-                        activeDot={{ r: 4, fill: chartColor, stroke: "#0f172a", strokeWidth: 2 }}
-                      />
-                      <Scatter
-                        name="marker"
-                        data={txPointsGrouped}
-                        dataKey="price"
-                    shape={(p) => {
-                      const isBuy = p.payload.type === "buy";
-                      return (
-                        <circle
-                          cx={p.cx}
-                          cy={p.cy}
-                          r={4}
-                          fill={isBuy ? "#34d399" : "#f87171"}
-                          fillOpacity={0.85}
-                          stroke="#0f172a"
-                          strokeWidth={1.5}
+                <div style={{ height: 200 }} className="mt-1 relative">
+                  {loadingHistory && (
+                    <div className="absolute inset-0 flex items-center justify-center text-xs text-slate-500">Ładuję notowania…</div>
+                  )}
+                  {!loadingHistory && !hasData && (
+                    <div className="absolute inset-0 flex items-center justify-center text-center text-xs text-slate-500 px-6">
+                      Nie udało się pobrać notowań{historyError ? `: ${historyError}` : ""}
+                    </div>
+                  )}
+                  {!loadingHistory && hasData && (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <ComposedChart data={chartData} margin={{ left: 0, right: 0, top: 8, bottom: 0 }}>
+                        <defs>
+                          <linearGradient id="priceGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={chartColor} stopOpacity={0.35} />
+                            <stop offset="100%" stopColor={chartColor} stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid vertical={false} stroke="#1e293b" strokeDasharray="3 3" />
+                        <XAxis
+                          dataKey="t"
+                          type="number"
+                          scale="time"
+                          domain={["dataMin", "dataMax"]}
+                          tickFormatter={fmtAxisTime}
+                          tick={{ fontSize: 10, fill: "#64748b" }}
+                          axisLine={{ stroke: "#1e293b" }}
+                          tickLine={false}
+                          minTickGap={40}
                         />
-                      );
-                    }}
-                  />
-                </ComposedChart>
-              </ResponsiveContainer>
-            </div>
+                        <YAxis
+                          orientation="right"
+                          domain={["auto", "auto"]}
+                          tickFormatter={fmtAxisPrice}
+                          tick={{ fontSize: 10, fill: "#64748b" }}
+                          axisLine={false}
+                          tickLine={false}
+                          tickCount={4}
+                          width={46}
+                        />
+                        <Tooltip
+                          cursor={{ stroke: "#475569", strokeWidth: 1, strokeDasharray: "3 3" }}
+                          content={({ active, payload, label }) => {
+                            if (!active || !payload || !payload.length) return null;
+                            const dayTx = markersByX[label] || [];
+                            return (
+                              <div style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12, padding: "6px 10px" }}>
+                                <div style={{ color: "#94a3b8", marginBottom: 2 }}>
+                                  {new Date(label).toLocaleDateString("pl-PL", { day: "numeric", month: "short", year: "numeric" })}
+                                  {(timeframe === "1d" || timeframe === "1t") &&
+                                    " · " + new Date(label).toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}
+                                </div>
+                                <div style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmtPLN(payload[0].value)}</div>
+                                {dayTx.map((m, i) => (
+                                  <div key={i} style={{ color: m.type === "buy" ? "#34d399" : "#f87171", marginTop: 2 }}>
+                                    {m.type === "buy" ? "Kupno" : "Sprzedaż"} {Number(m.qty.toFixed(4))} szt. po {fmtPLN(m.avgPrice)}
+                                  </div>
+                                ))}
+                              </div>
+                            );
+                          }}
+                        />
+                        <Area
+                          type="linear"
+                          dataKey="price"
+                          stroke={chartColor}
+                          strokeWidth={2}
+                          fill="url(#priceGradient)"
+                          dot={false}
+                          isAnimationActive
+                          activeDot={{ r: 4, fill: chartColor, stroke: "#0f172a", strokeWidth: 2 }}
+                        />
+                        {markers.map((m, i) => (
+                          <ReferenceDot
+                            key={i}
+                            x={m.x}
+                            y={m.y}
+                            r={5}
+                            fill={m.type === "buy" ? "#34d399" : "#f87171"}
+                            stroke="#0f172a"
+                            strokeWidth={2}
+                            ifOverflow="extendDomain"
+                          />
+                        ))}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
               </>
             );
           })()}
-          <div className="flex items-center gap-1.5 mt-3">
+          <div className="flex items-center gap-1.5 mt-3 flex-wrap">
             {TIMEFRAMES.map((tf) => (
               <button
                 key={tf.key}
@@ -2169,20 +2378,11 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
               </button>
             ))}
           </div>
-          <div className="flex items-center gap-3 mt-3 text-xs text-slate-500">
-            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-400" /> Kupno</span>
-            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-rose-400" /> Sprzedaż</span>
-            {loadingHistory && <span className="ml-auto">Ładuję historię…</span>}
-          </div>
-          {!loadingHistory && usingOwnData && (
-            <p className="text-xs text-amber-500 mt-2 flex items-start gap-1">
-              <span>⚠</span>
-              <span>
-                {historyError
-                  ? `To NIE jest prawdziwy kurs giełdowy (linia przerywana) — pokazane są tylko Twoje transakcje. Powód: ${historyError}`
-                  : "To NIE jest prawdziwy kurs giełdowy (linia przerywana) — pokazane są tylko Twoje transakcje."}
-              </span>
-            </p>
+          {markers.length > 0 && (
+            <div className="flex items-center gap-3 mt-3 text-xs text-slate-500">
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-400" /> Twoje kupno</span>
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-rose-400" /> Twoja sprzedaż</span>
+            </div>
           )}
         </div>
 
@@ -2463,7 +2663,7 @@ function parseIngMaklerskiCsv(text) {
     const quantity = parsePLNumber(qtyRaw);
     const price = parsePLNumber(priceRaw);
     if (!ticker || !Number.isFinite(quantity) || !Number.isFinite(price)) continue;
-    txs.push({ ticker, name: ticker.replace(/\.PL$/, ""), type, quantity, price, currency: "PLN", date });
+    txs.push(normalizeTx({ ticker, name: ticker.replace(/\.PL$/, ""), type, quantity, price, currency: "PLN", date }));
   }
   return txs;
 }
