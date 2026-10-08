@@ -87,7 +87,7 @@ const SEED_XTB_TRANSACTIONS = [
 const CURRENCIES = ["PLN", "USD", "EUR"];
 const STORAGE_KEY = "portfolio:transactions";
 const PORTFOLIOS_KEY = "portfolio:portfolios";
-const APP_VERSION = "v14";
+const APP_VERSION = "v15";
 const PRICES_KEY = "portfolio:prices-cache";
 const DIVIDENDS_KEY = "portfolio:dividends-cache";
 const TWELVEDATA_KEY_STORAGE = "portfolio:twelvedata-api-key";
@@ -340,7 +340,7 @@ function uid() {
 // Mapujemy nazwę z ING na ticker GPW, żeby kursy, dywidendy i łączenie pozycji działały.
 const TICKER_ALIASES = {
   "CDPROJEKT.PL": { ticker: "CDR.PL", name: "CD Projekt RED" },
-  "DIA1.PL": { ticker: "DIAG.PL", name: "Diagnostyka" },
+  "DIA1.PL": { ticker: "DIA.PL", name: "Diagnostyka" },
   "DINOPL.PL": { ticker: "DNP.PL", name: "Dino Polska" },
   "PKNORLEN.PL": { ticker: "PKN.PL", name: "Orlen" },
   "AUTOPARTN.PL": { ticker: "APR.PL", name: "Auto Partner" },
@@ -355,7 +355,11 @@ const TICKER_ALIASES = {
   "VOXEL.PL": { ticker: "VOX.PL", name: "Voxel" },
   "MODIVO.PL": { ticker: "MDV.PL", name: "Modivo" },
   "CCC.PL": { ticker: "MDV.PL", name: "Modivo" },
-  "DIAG.PL": { ticker: "DIAG.PL", name: "Diagnostyka" },
+  "DIAG.PL": { ticker: "DIA.PL", name: "Diagnostyka" },
+  "ASBIS.PL": { ticker: "ASB.PL", name: "ASBIS" },
+  "NOVAVISGR.PL": { ticker: "NVG.PL", name: "Nova Vis Group" },
+  // Spółka z USA kupiona w ING w złotówkach — kurs bierzemy z NASDAQ i przeliczamy na PLN
+  "TAKETWO.PL": { ticker: "TTWO.US", name: "Take-Two Interactive" },
 };
 function normalizeTx(t) {
   const alias = TICKER_ALIASES[String(t.ticker || "").toUpperCase().trim()];
@@ -1067,12 +1071,33 @@ export default function App() {
     setRefreshing(false);
   }, [holdings, prices, twelveDataKey]);
 
+  const refreshRef = useRef(refreshPrices);
+  refreshRef.current = refreshPrices;
+  const lastAutoRefresh = useRef(0);
   const autoRefreshed = useRef(false);
   useEffect(() => {
     if (!loaded || autoRefreshed.current || !holdings.length) return;
     autoRefreshed.current = true;
+    lastAutoRefresh.current = Date.now();
     refreshPrices();
   }, [loaded, holdings.length, refreshPrices]);
+  useEffect(() => {
+    if (!loaded) return;
+    const maybeRefresh = () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastAutoRefresh.current < 60 * 1000) return; // nie częściej niż co minutę
+      lastAutoRefresh.current = Date.now();
+      refreshRef.current();
+    };
+    document.addEventListener("visibilitychange", maybeRefresh);
+    window.addEventListener("focus", maybeRefresh);
+    const timer = setInterval(() => { lastAutoRefresh.current = 0; maybeRefresh(); }, 5 * 60 * 1000);
+    return () => {
+      document.removeEventListener("visibilitychange", maybeRefresh);
+      window.removeEventListener("focus", maybeRefresh);
+      clearInterval(timer);
+    };
+  }, [loaded]);
 
   const refreshDividends = useCallback(async () => {
     const byTicker = {};
