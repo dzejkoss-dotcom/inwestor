@@ -37,8 +37,22 @@ export default async function handler(req, res) {
         }))
       : [];
 
+    // Bieżąca cena i poprzednie zamknięcie dokładnie tak, jak pokazuje je Yahoo/Google,
+    // plus godziny sesji giełdy (do kropki "rynek otwarty")
+    const m = result.meta || {};
+    const reg = m.currentTradingPeriod?.regular;
+    const meta = {
+      price: m.regularMarketPrice ?? null,
+      previousClose: m.previousClose ?? m.chartPreviousClose ?? null,
+      currency: m.currency ?? null,
+      time: m.regularMarketTime ? new Date(m.regularMarketTime * 1000).toISOString() : null,
+      sessionStart: reg?.start ? reg.start * 1000 : null,
+      sessionEnd: reg?.end ? reg.end * 1000 : null,
+      exchange: m.exchangeName ?? null,
+    };
+
     res.setHeader("Cache-Control", "public, max-age=60");
-    res.status(200).json({ rows, dividends });
+    res.status(200).json({ rows, dividends, meta });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }
