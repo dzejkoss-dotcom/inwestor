@@ -87,7 +87,7 @@ const SEED_XTB_TRANSACTIONS = [
 const CURRENCIES = ["PLN", "USD", "EUR"];
 const STORAGE_KEY = "portfolio:transactions";
 const PORTFOLIOS_KEY = "portfolio:portfolios";
-const APP_VERSION = "v15";
+const APP_VERSION = "v16";
 const PRICES_KEY = "portfolio:prices-cache";
 const DIVIDENDS_KEY = "portfolio:dividends-cache";
 const TWELVEDATA_KEY_STORAGE = "portfolio:twelvedata-api-key";
@@ -279,6 +279,7 @@ function getMarketStatus(ticker, liveOpen) {
   if (upper.endsWith(".US")) { tz = "America/New_York"; openMin = 9 * 60 + 30; closeMin = 16 * 60; }
   else if (upper.endsWith(".PL")) { tz = "Europe/Warsaw"; openMin = 9 * 60; closeMin = 17 * 60; }
   else if (upper.endsWith(".UK")) { tz = "Europe/London"; openMin = 8 * 60; closeMin = 16 * 60 + 30; }
+  else if (EUR_SUFFIXES.some((x) => upper.endsWith("." + x))) { tz = "Europe/Berlin"; openMin = 9 * 60; closeMin = 17 * 60 + 30; }
   else tz = null;
 
   let isWeekend = false;
@@ -601,6 +602,14 @@ function toYahooSymbol(ticker) {
   return upper;
 }
 
+async function fetchYahooMeta(yahooSymbol) {
+  const url = `/api/yahoo-proxy?symbol=${encodeURIComponent(yahooSymbol)}&range=1d&interval=5m`;
+  const resp = await fetch(url);
+  const data = await resp.json();
+  if (!resp.ok || data.error) throw new Error(data.error || "Błąd Yahoo Finance");
+  return data.meta || {};
+}
+
 async function fetchYahooSeries(yahooSymbol, range, interval) {
   const url = `/api/yahoo-proxy?symbol=${encodeURIComponent(yahooSymbol)}&range=${range || "3mo"}&interval=${interval || "1d"}`;
   const resp = await fetch(url);
@@ -630,19 +639,28 @@ function quantityHeldOnDate(tickerTxSorted, dateMs) {
 async function fetchYahooQuote(ticker, usdPlnRate) {
   const cur = quoteCurrency(ticker);
   const yahooSymbol = toYahooSymbol(ticker);
-  const rows = await fetchYahooSeries(yahooSymbol, "5d");
-  const last = rows[rows.length - 1];
-  const prev = rows.length >= 2 ? rows[rows.length - 2] : null;
-  let changeAbsolute = 0, changePercent = 0;
-  if (prev) {
-    changeAbsolute = last.close - prev.close;
-    changePercent = (changeAbsolute / prev.close) * 100;
+  let price = null, prev = null, asOf = "", isMarketOpen = null;
+  try {
+    const m = await fetchYahooMeta(yahooSymbol);
+    if (Number.isFinite(m.price)) price = m.price;
+    if (Number.isFinite(m.previousClose)) prev = m.previousClose;
+    asOf = m.time || "";
+    if (m.sessionStart && m.sessionEnd) isMarketOpen = Date.now() >= m.sessionStart && Date.now() < m.sessionEnd;
+  } catch (e) {}
+  if (price == null || prev == null) {
+    const rows = await fetchYahooSeries(yahooSymbol, "5d");
+    const last = rows[rows.length - 1];
+    if (price == null) { price = last.close; asOf = last.date; }
+    if (prev == null) prev = rows.length >= 2 ? rows[rows.length - 2].close : price;
   }
+  const changeNative = price - prev;
+  const changePercent = prev ? (changeNative / prev) * 100 : 0;
+  const native = { nativePrice: price, nativeCurrency: cur };
   if (cur === "PLN") {
-    return { price: last.close, changeAbsolute, changePercent, currency: "PLN", asOf: last.date };
+    return { price, changeAbsolute: changeNative, changePercent, currency: "PLN", asOf, isMarketOpen, ...native };
   }
   const fx = (cur === "USD" && usdPlnRate ? usdPlnRate : await latestFxRate(cur)) * fxMultiplierUnit(ticker);
-  return { price: last.close * fx, changeAbsolute: changeAbsolute * fx, changePercent, currency: "PLN", asOf: last.date, fxOk: true };
+  return { price: price * fx, changeAbsolute: changeNative * fx, changePercent, currency: "PLN", asOf, isMarketOpen, fxOk: true, ...native };
 }
 
 async function fetchStooqQuote(ticker, usdPlnRate) {
@@ -986,9 +1004,25 @@ export default function App() {
     let tdCount = 0;
     let tdErrorMsg = "";
 
-    if (twelveDataKey) {
-      const usTickers = holdings.filter((h) => h.ticker.toUpperCase().endsWith(".US")).map((h) => h.ticker.replace(/\.US$/i, ""));
-      const plTickers = holdings.filter((h) => h.ticker.toUpperCase().endsWith(".PL")).map((h) => h.ticker.replace(/\.PL$/i, ""));
+    // 1. Yahoo (te same dane co Google Finance) dla wszystkich spółek
+    let yahooErrorMsg = "";
+    let yahooCount = 0;
+    const yahooTargets = holdings.filter((h) => !h.ticker.toUpperCase().endsWith(".FUND"));
+    await Promise.all(yahooTargets.map(async (h) => {
+      try {
+        const q = await fetchYahooQuote(h.ticker, usdPlnRate);
+        resolved[h.ticker] = { ...q, source: "yahoo", fetchedAt: Date.now() };
+        yahooCount++;
+      } catch (e) {
+        if (!yahooErrorMsg) yahooErrorMsg = `${h.ticker}: ${String(e.message || e)}`;
+      }
+    }));
+
+    // 2. Twelve Data tylko dla spółek, których Yahoo nie zwróciło
+    const tdHoldings = holdings.filter((h) => !resolved[h.ticker]);
+    if (twelveDataKey && tdHoldings.length) {
+      const usTickers = tdHoldings.filter((h) => h.ticker.toUpperCase().endsWith(".US")).map((h) => h.ticker.replace(/\.US$/i, ""));
+      const plTickers = tdHoldings.filter((h) => h.ticker.toUpperCase().endsWith(".PL")).map((h) => h.ticker.replace(/\.PL$/i, ""));
       try {
         const [usData, plData, fxData] = await Promise.all([
           fetchTwelveDataBatch(usTickers, null, twelveDataKey).catch((e) => { tdErrorMsg = tdErrorMsg || `USD: ${String(e.message || e)}`; return {}; }),
@@ -997,7 +1031,7 @@ export default function App() {
         ]);
         const tdUsdPlnEntry = fxData["USD/PLN"];
         const tdUsdPlnRate = tdUsdPlnEntry && Number.isFinite(parseFloat(tdUsdPlnEntry.close)) ? parseFloat(tdUsdPlnEntry.close) : (usdPlnRate || null);
-        for (const h of holdings) {
+        for (const h of tdHoldings) {
           if (h.ticker.toUpperCase().endsWith(".FUND")) continue;
           const isUS = h.ticker.toUpperCase().endsWith(".US");
           const isPL = h.ticker.toUpperCase().endsWith(".PL");
@@ -1030,15 +1064,8 @@ export default function App() {
     }
 
     const remaining = holdings.filter((h) => !resolved[h.ticker] && !h.ticker.toUpperCase().endsWith(".FUND"));
-    let yahooErrorMsg = "";
     const results = await Promise.all(
       remaining.map(async (h) => {
-        try {
-          const q = await fetchYahooQuote(h.ticker, usdPlnRate);
-          return { ticker: h.ticker, quote: { ...q, source: "yahoo", fetchedAt: Date.now() } };
-        } catch (e) {
-          if (!yahooErrorMsg) yahooErrorMsg = `${h.ticker}: ${String(e.message || e)}`;
-        }
         try {
           const q = await fetchTickerQuote(h.ticker);
           return { ticker: h.ticker, quote: { ...q, source: "ai", fetchedAt: Date.now() } };
@@ -1049,13 +1076,12 @@ export default function App() {
     );
 
     const next = { ...prices, ...resolved };
-    let yahooCount = 0, aiCount = 0;
+    let aiCount = 0;
     const failedTickers = [];
     for (const r of results) {
       if (r.quote) {
         next[r.ticker] = r.quote;
-        if (r.quote.source === "yahoo") yahooCount++;
-        else aiCount++;
+        aiCount++;
       } else {
         failedTickers.push(r.ticker);
       }
@@ -1063,9 +1089,9 @@ export default function App() {
     setPrices(next);
     window.storage.set(PRICES_KEY, JSON.stringify(next), false).catch(() => {});
     const parts = [];
-    if (twelveDataKey) parts.push(`Twelve Data: ${tdCount}/${holdings.length}${tdCount === 0 && tdErrorMsg ? ` (${tdErrorMsg})` : ""}`);
-    parts.push(`Yahoo: ${yahooCount}/${remaining.length}${yahooCount === 0 && yahooErrorMsg ? ` (${yahooErrorMsg})` : ""}`);
-    parts.push(`AI: ${aiCount}/${remaining.length}`);
+    parts.push(`Yahoo: ${yahooCount}/${yahooTargets.length}${yahooCount < yahooTargets.length && yahooErrorMsg ? ` (${yahooErrorMsg})` : ""}`);
+    if (twelveDataKey && tdHoldings.length) parts.push(`Twelve Data: ${tdCount}/${tdHoldings.length}${tdCount === 0 && tdErrorMsg ? ` (${tdErrorMsg})` : ""}`);
+    if (remaining.length) parts.push(`AI: ${aiCount}/${remaining.length}`);
     if (failedTickers.length) parts.push(`bez danych: ${failedTickers.join(", ")}`);
     setRefreshError(parts.join(" · "));
     setRefreshing(false);
