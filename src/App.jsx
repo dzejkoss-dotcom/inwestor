@@ -87,7 +87,7 @@ const SEED_XTB_TRANSACTIONS = [
 const CURRENCIES = ["PLN", "USD", "EUR"];
 const STORAGE_KEY = "portfolio:transactions";
 const PORTFOLIOS_KEY = "portfolio:portfolios";
-const APP_VERSION = "v9";
+const APP_VERSION = "v13";
 const PRICES_KEY = "portfolio:prices-cache";
 const DIVIDENDS_KEY = "portfolio:dividends-cache";
 const TWELVEDATA_KEY_STORAGE = "portfolio:twelvedata-api-key";
@@ -170,6 +170,7 @@ const SEED_IKE_TRANSACTIONS = [
 const PIE_COLORS = ["#fbbf24", "#34d399", "#60a5fa", "#f87171", "#a78bfa", "#fb923c", "#2dd4bf", "#f472b6"];
 
 const CATEGORY_MAP = {
+  "PPK.FUND": "Fundusze PPK",
   "SPCX.US": "Technologia",
   "AMZN.US": "Technologia",
   "MSFT.US": "Technologia",
@@ -177,6 +178,7 @@ const CATEGORY_MAP = {
   "TTWO.US": "Gaming",
   "CDR.PL": "Gaming",
   "CCC.PL": "Handel detaliczny",
+  "MDV.PL": "Handel detaliczny",
   "XTB.PL": "Finanse",
   "CBF.PL": "Technologia",
   "DAT.PL": "AI i półprzewodniki",
@@ -191,6 +193,7 @@ const CATEGORY_COLORS = {
   "Handel detaliczny": "#fb923c",
   "Finanse": "#34d399",
   "ETF / Indeksy": "#fbbf24",
+  "Fundusze PPK": "#2dd4bf",
   "Inne": "#94a3b8",
 };
 
@@ -202,6 +205,7 @@ const LOGO_DOMAIN_MAP = {
   "TTWO.US": "take2games.com",
   "CDR.PL": "cdprojekt.com",
   "CCC.PL": "modivo.pl",
+  "MDV.PL": "modivo.pl",
   "XTB.PL": "xtb.com",
   "CBF.PL": "cyberfolks.pl",
   "DAT.PL": "datawalk.com",
@@ -245,9 +249,11 @@ function CompanyIcon({ ticker, size = 44 }) {
 }
 
 const BENCHMARKS = [
-  { key: "wig", label: "WIG", symbol: "WIG.WA" },
-  { key: "wig20", label: "WIG20", symbol: "WIG20.WA" },
-  { key: "wig40", label: "WIG40 (mWIG40)", symbol: "MWIG40.WA" },
+  // Yahoo nie ma historii polskich indeksów (zwraca 1 punkt), dlatego używamy ETF-ów Beta
+  // odwzorowujących indeksy w wersji TR (z reinwestowanymi dywidendami).
+  { key: "wig20", label: "WIG20TR", symbol: "ETFBW20TR.WA" },
+  { key: "wig40", label: "mWIG40TR", symbol: "ETFBM40TR.WA" },
+  { key: "swig80", label: "sWIG80TR", symbol: "ETFBS80TR.WA" },
   { key: "sp500", label: "S&P 500", symbol: "^GSPC", currency: "USD" },
   { key: "nasdaq100", label: "NASDAQ 100", symbol: "^NDX", currency: "USD" },
 ];
@@ -347,7 +353,8 @@ const TICKER_ALIASES = {
   "PEPCO.PL": { ticker: "PCO.PL", name: "Pepco" },
   "BLOOBER.PL": { ticker: "BLO.PL", name: "Bloober Team" },
   "VOXEL.PL": { ticker: "VOX.PL", name: "Voxel" },
-  "MODIVO.PL": { ticker: "CCC.PL", name: "Modivo" },
+  "MODIVO.PL": { ticker: "MDV.PL", name: "Modivo" },
+  "CCC.PL": { ticker: "MDV.PL", name: "Modivo" },
   "DIAG.PL": { ticker: "DIAG.PL", name: "Diagnostyka" },
 };
 function normalizeTx(t) {
@@ -356,6 +363,33 @@ function normalizeTx(t) {
   const rawName = String(t.ticker).replace(/\.PL$/i, "");
   const keepName = t.name && t.name.trim() && t.name.trim().toUpperCase() !== rawName.toUpperCase();
   return { ...t, ticker: alias.ticker, name: keepName ? t.name : alias.name };
+}
+
+// Ta sama transakcja zapisana w dwóch plikach może różnić się zaokrągleniem ceny
+// (np. 1600,5964 vs 1600,59641629) albo brakiem godziny w dacie. Traktujemy je jako jedną.
+// Dwie transakcje z różnymi godzinami to zawsze dwie osobne transakcje.
+function sameTx(a, b) {
+  if (a.portfolioId !== b.portfolioId || a.type !== b.type) return false;
+  if (String(a.ticker).toUpperCase().trim() !== String(b.ticker).toUpperCase().trim()) return false;
+  if (Math.abs(Number(a.quantity) - Number(b.quantity)) > 1e-6) return false;
+  if (Math.abs(Number(a.price) - Number(b.price)) > 0.005) return false;
+  const da = String(a.date), db = String(b.date);
+  if (da === db) return true;
+  const hasTime = (d) => d.length > 10;
+  if (hasTime(da) && hasTime(db)) return false;
+  return da.slice(0, 10) === db.slice(0, 10);
+}
+// Usuwa kopie powstałe przez ponowny import (różnią się zapisem, nie treścią).
+// Identyczne co do znaku pary zostają — to prawdziwe, osobne transakcje (np. dwie sprzedaże w tej samej sekundzie).
+function removeNearDuplicates(list) {
+  const out = [];
+  let removed = 0;
+  for (const t of list) {
+    const dup = out.some((o) => sameTx(o, t) && txFingerprint(o) !== txFingerprint(t));
+    if (dup) { removed++; continue; }
+    out.push(t);
+  }
+  return { list: out, removed };
 }
 
 function txFingerprint(t) {
@@ -531,6 +565,30 @@ async function fetchStooqSeries(symbol, d1, d2) {
   return rows;
 }
 
+// Waluta notowań wg sufiksu giełdy w tickerze
+const EUR_SUFFIXES = ["DE", "NL", "FR", "IT", "ES", "FI", "IE", "AT", "BE", "PT"];
+function quoteCurrency(ticker) {
+  const suf = (String(ticker).toUpperCase().match(/\.([A-Z]+)$/) || [])[1];
+  if (suf === "US") return "USD";
+  if (suf === "UK") return "GBP";
+  if (EUR_SUFFIXES.includes(suf)) return "EUR";
+  return "PLN";
+}
+// Para walutowa w Yahoo; dla Londynu notowania są w pensach, stąd mnożnik 1/100
+const FX_SYMBOL = { USD: "PLN=X", EUR: "EURPLN=X", GBP: "GBPPLN=X" };
+function fxMultiplierUnit(ticker) {
+  return quoteCurrency(ticker) === "GBP" ? 0.01 : 1;
+}
+const fxLatestCache = {};
+async function latestFxRate(cur) {
+  if (cur === "PLN") return 1;
+  if (fxLatestCache[cur] && Date.now() - fxLatestCache[cur].at < 10 * 60 * 1000) return fxLatestCache[cur].rate;
+  const rows = await fetchYahooSeries(FX_SYMBOL[cur], "5d");
+  const rate = rows[rows.length - 1].close;
+  fxLatestCache[cur] = { rate, at: Date.now() };
+  return rate;
+}
+
 function toYahooSymbol(ticker) {
   const upper = ticker.toUpperCase();
   if (upper.endsWith(".PL")) return upper.replace(/\.PL$/, "") + ".WA";
@@ -566,9 +624,7 @@ function quantityHeldOnDate(tickerTxSorted, dateMs) {
 }
 
 async function fetchYahooQuote(ticker, usdPlnRate) {
-  const upper = ticker.toUpperCase();
-  const isUS = upper.endsWith(".US");
-  const isPL = upper.endsWith(".PL");
+  const cur = quoteCurrency(ticker);
   const yahooSymbol = toYahooSymbol(ticker);
   const rows = await fetchYahooSeries(yahooSymbol, "5d");
   const last = rows[rows.length - 1];
@@ -578,10 +634,10 @@ async function fetchYahooQuote(ticker, usdPlnRate) {
     changeAbsolute = last.close - prev.close;
     changePercent = (changeAbsolute / prev.close) * 100;
   }
-  if (isPL || !isUS) {
+  if (cur === "PLN") {
     return { price: last.close, changeAbsolute, changePercent, currency: "PLN", asOf: last.date };
   }
-  const fx = usdPlnRate ?? (await fetchYahooSeries("PLN=X", "5d")).slice(-1)[0].close;
+  const fx = (cur === "USD" && usdPlnRate ? usdPlnRate : await latestFxRate(cur)) * fxMultiplierUnit(ticker);
   return { price: last.close * fx, changeAbsolute: changeAbsolute * fx, changePercent, currency: "PLN", asOf: last.date };
 }
 
@@ -699,7 +755,7 @@ export default function App() {
         window.storage.set(SEED_IKE_FLAG_KEY, "1", false).catch(() => {});
       }
 
-      const migrated = txRaw.map(normalizeTx).map((tx) => {
+      const migrated = removeNearDuplicates(txRaw.map(normalizeTx)).list.map((tx) => {
         if (tx.portfolioId) return tx;
         let pid = nameToId[tx.broker];
         if (!pid) {
@@ -814,22 +870,38 @@ export default function App() {
   const animatedCagr = useCountUp(metrics.cagr, 700, dashVisit);
   const animatedTotalProfit = useCountUp(metrics.totalProfit, 700, dashVisit);
 
-  const addTransactions = useCallback((txs) => {
+  const addTransactions = useCallback((incoming) => {
     let skippedDuplicates = 0;
-    setTransactions((prev) => {
+    // Wycena funduszu (PPK) z pliku — fundusze nie mają notowań w Yahoo
+    const navByTicker = {};
+    for (const t of incoming) if (t.fundNav) navByTicker[t.ticker] = t.fundNav;
+    if (Object.keys(navByTicker).length) {
+      setPrices((prevPrices) => {
+        const next = { ...prevPrices };
+        for (const [tk, nav] of Object.entries(navByTicker)) {
+          const old = next[tk];
+          if (!old || !old.asOf || String(old.asOf) <= String(nav.asOf)) {
+            next[tk] = { price: nav.price, changeAbsolute: 0, changePercent: 0, currency: "PLN", asOf: nav.asOf, source: "plik", fetchedAt: Date.now() };
+          }
+        }
+        window.storage.set(PRICES_KEY, JSON.stringify(next), false).catch(() => {});
+        return next;
+      });
+    }
+    const replaceKeys = new Set(incoming.filter((t) => t.replaceGroup).map((t) => `${t.portfolioId}|${t.ticker}`));
+    const txs = incoming.map(({ replaceGroup, fundNav, ...rest }) => rest);
+    setTransactions((prevAll) => {
+      // Plik PPK zawiera pełny stan (z saldami), więc zastępuje wcześniejsze dane PPK w tym portfelu
+      const prev = replaceKeys.size ? prevAll.filter((t) => !replaceKeys.has(`${t.portfolioId}|${t.ticker}`)) : prevAll;
       // Liczymy wystąpienia, a nie samą obecność: dwie identyczne transakcje w pliku
       // (np. dwie sprzedaże po 19 szt. w tej samej sekundzie) są prawdziwe i obie zostają.
       // Przy ponownym imporcie tego samego pliku pomijamy tyle kopii, ile już istnieje.
-      const existingCounts = {};
-      for (const t of prev) {
-        const fp = txFingerprint(t);
-        existingCounts[fp] = (existingCounts[fp] || 0) + 1;
-      }
+      const used = new Set();
       const toAdd = [];
       for (const t of txs) {
-        const fp = txFingerprint(t);
-        if (existingCounts[fp] > 0) {
-          existingCounts[fp]--;
+        const idx = prev.findIndex((p, i) => !used.has(i) && sameTx(p, t));
+        if (idx >= 0) {
+          used.add(idx);
           skippedDuplicates++;
           continue;
         }
@@ -842,6 +914,34 @@ export default function App() {
 
   const deleteTransaction = useCallback((id) => {
     setTransactions((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const deleteTransactions = useCallback((ids) => {
+    const set = new Set(ids);
+    setTransactions((prev) => prev.filter((t) => !set.has(t.id)));
+  }, []);
+
+  // Przeniesienie do innego portfela. Jeśli identyczna transakcja już tam jest
+  // (np. ten sam plik wgrany do obu portfeli), kopia jest usuwana zamiast dublowana.
+  const moveTransactions = useCallback((ids, targetId) => {
+    const set = new Set(ids);
+    setTransactions((prev) => {
+      const counts = {};
+      for (const t of prev) {
+        if (t.portfolioId !== targetId || set.has(t.id)) continue;
+        const fp = txFingerprint(t);
+        counts[fp] = (counts[fp] || 0) + 1;
+      }
+      const out = [];
+      for (const t of prev) {
+        if (!set.has(t.id)) { out.push(t); continue; }
+        const moved = { ...t, portfolioId: targetId };
+        const fp = txFingerprint(moved);
+        if (counts[fp] > 0) { counts[fp]--; continue; }
+        out.push(moved);
+      }
+      return out;
+    });
   }, []);
 
   const addPortfolio = useCallback((name) => {
@@ -887,6 +987,7 @@ export default function App() {
         const tdUsdPlnEntry = fxData["USD/PLN"];
         const tdUsdPlnRate = tdUsdPlnEntry && Number.isFinite(parseFloat(tdUsdPlnEntry.close)) ? parseFloat(tdUsdPlnEntry.close) : (usdPlnRate || null);
         for (const h of holdings) {
+          if (h.ticker.toUpperCase().endsWith(".FUND")) continue;
           const isUS = h.ticker.toUpperCase().endsWith(".US");
           const isPL = h.ticker.toUpperCase().endsWith(".PL");
           const bareSymbol = h.ticker.replace(/\.(US|PL)$/i, "");
@@ -917,7 +1018,7 @@ export default function App() {
       } catch (e) { tdErrorMsg = tdErrorMsg || String(e.message || e); }
     }
 
-    const remaining = holdings.filter((h) => !resolved[h.ticker]);
+    const remaining = holdings.filter((h) => !resolved[h.ticker] && !h.ticker.toUpperCase().endsWith(".FUND"));
     let yahooErrorMsg = "";
     const results = await Promise.all(
       remaining.map(async (h) => {
@@ -966,7 +1067,7 @@ export default function App() {
       if (!byTicker[key]) byTicker[key] = [];
       byTicker[key].push(t);
     }
-    const tickers = Object.keys(byTicker);
+    const tickers = Object.keys(byTicker).filter((t) => !t.endsWith(".FUND"));
     if (!tickers.length) return;
 
     let usdPlnRate = null;
@@ -984,8 +1085,8 @@ export default function App() {
       try {
         const yahooSymbol = toYahooSymbol(ticker);
         const divs = await fetchYahooDividends(yahooSymbol);
-        const isUS = ticker.toUpperCase().endsWith(".US");
-        const fx = isUS ? (usdPlnRate || 1) : 1;
+        const cur = quoteCurrency(ticker);
+        const fx = cur === "PLN" ? 1 : (cur === "USD" && usdPlnRate ? usdPlnRate : await latestFxRate(cur).catch(() => 1)) * fxMultiplierUnit(ticker);
         for (const d of divs) {
           const dateMs = new Date(d.date).getTime();
           const qty = quantityHeldOnDate(sortedTxs, dateMs);
@@ -1377,8 +1478,11 @@ export default function App() {
         <HistorySheet
           transactions={[...transactions].sort((a, b) => new Date(b.date) - new Date(a.date))}
           portfolioName={portfolioName}
+          portfolios={portfolios}
           onClose={() => setShowHistory(false)}
           onDelete={deleteTransaction}
+          onDeleteMany={deleteTransactions}
+          onMoveMany={moveTransactions}
         />
       )}
       {showImport && (
@@ -1753,24 +1857,32 @@ function StatystykiTab({ transactions, portfolios, prices }) {
 
       const tickers = [...new Set(txs.map((t) => t.ticker.toUpperCase()))];
       const benchKeys = [...selectedBenchmarks];
-      const needFx = tickers.some((t) => t.endsWith(".US")) || benchKeys.some((k) => BENCHMARKS.find((b) => b.key === k)?.currency === "USD");
+      const curs = new Set(tickers.map(quoteCurrency));
+      for (const k of benchKeys) { const c = BENCHMARKS.find((b) => b.key === k)?.currency; if (c) curs.add(c); }
+      curs.delete("PLN");
 
       setCompProgress(`Pobieram notowania ${tickers.length} spółek…`);
-      const fxRows = needFx ? await fetchYahooSeries("PLN=X", range, "1d").catch(() => null) : null;
-      const fx = fxRows ? onGrid(days, fxRows) : null;
-      if (needFx && !fx) throw new Error("nie udało się pobrać kursu USD/PLN");
+      const fxGrids = {};
+      for (const c of curs) {
+        const rows = await fetchYahooSeries(FX_SYMBOL[c], range, "1d").catch(() => null);
+        if (!rows) throw new Error(`nie udało się pobrać kursu ${c}/PLN`);
+        fxGrids[c] = onGrid(days, rows);
+      }
+      const fx = fxGrids.USD || null;
 
       // Ceny spółek w PLN na każdy dzień. Gdy Yahoo nie zna spółki — ceny z Twoich transakcji.
       const missing = [];
       const priceByTicker = {};
       await mapLimit(tickers, 6, async (tk) => {
-        const isUS = tk.endsWith(".US");
+        const cur = quoteCurrency(tk);
         try {
+          if (tk.endsWith(".FUND")) throw Object.assign(new Error("fundusz"), { fund: true });
           const rows = await fetchYahooSeries(toYahooSymbol(tk), range, "1d");
           const grid = onGrid(days, rows);
-          priceByTicker[tk] = isUS ? grid.map((v, i) => (v != null && fx[i] ? v * fx[i] : v)) : grid;
+          const g = fxGrids[cur], unit = fxMultiplierUnit(tk);
+          priceByTicker[tk] = g ? grid.map((v, i) => (v != null && g[i] ? v * g[i] * unit : v)) : grid;
         } catch (e) {
-          missing.push(tk.replace(/\.(PL|US|UK)$/, ""));
+          if (!e.fund) missing.push(tk.replace(/\.(PL|US|UK)$/, ""));
           const own = txs.filter((t) => t.ticker.toUpperCase() === tk).map((t) => ({ date: new Date(t.ms).toISOString(), close: Number(t.price) }));
           priceByTicker[tk] = onGrid(days, own); // ceny z transakcji są już w PLN
         }
@@ -1806,6 +1918,7 @@ function StatystykiTab({ transactions, portfolios, prices }) {
       const errors = [];
       for (const key of benchKeys) {
         const b = BENCHMARKS.find((x) => x.key === key);
+        if (!b) continue;
         try {
           const rows = await fetchYahooSeries(b.symbol, range, "1d");
           const grid = onGrid(days, rows);
@@ -2094,7 +2207,7 @@ function StatystykiTab({ transactions, portfolios, prices }) {
           </p>
         )}
         <p className="text-xs text-slate-600 mt-3">
-          Żółta linia to rzeczywista wartość Twoich akcji każdego dnia. Indeks pokazuje, ile byłoby warte, gdybyś w tych samych dniach wpłacał i wypłacał te same kwoty do indeksu zamiast do spółek. Na początku wybranego okresu obie linie startują z tej samej kwoty. Indeksy z USA przeliczone na złote.
+          Żółta linia to rzeczywista wartość Twoich akcji każdego dnia. Indeks pokazuje, ile byłoby warte, gdybyś w tych samych dniach wpłacał i wypłacał te same kwoty do indeksu zamiast do spółek. Na początku wybranego okresu obie linie startują z tej samej kwoty. Polskie indeksy liczone na podstawie ETF-ów Beta w wersji TR (z reinwestowanymi dywidendami). Indeksy z USA przeliczone na złote.
         </p>
       </div>
     </div>
@@ -2169,13 +2282,32 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
       setLoadingHistory(true);
       setHistoryError("");
       try {
+        if (ticker.toUpperCase().endsWith(".FUND")) {
+          // Fundusz (PPK): wyceny jednostki z dni wpłat zapisane w pliku + ostatnia wycena
+          const tf = TIMEFRAMES.find((t) => t.key === timeframe);
+          const cutoff = tf && tf.days ? Date.now() - tf.days * 24 * 60 * 60 * 1000 : -Infinity;
+          const byDay = {};
+          for (const t of tickerTx) {
+            if (t.opening) continue;
+            const ms = new Date(t.date).getTime();
+            if (Number.isFinite(ms)) byDay[t.date.slice(0, 10)] = { t: ms, price: Number(t.price) };
+          }
+          const nav = prices[ticker];
+          if (nav?.price && nav.asOf) byDay[String(nav.asOf).slice(0, 10)] = { t: new Date(nav.asOf).getTime(), price: nav.price };
+          const series = Object.values(byDay).filter((p) => p.t >= cutoff).sort((a, b) => a.t - b.t);
+          if (series.length < 2) throw new Error("dla PPK wyceny są tylko z dni wpłat — wybierz 6M lub dłuższy okres");
+          if (!cancelled) setHistorySeries(series);
+          if (!cancelled) setLoadingHistory(false);
+          return;
+        }
         const cfg = CHART_CFG[timeframe] || CHART_CFG["1r"];
-        const isUS = ticker.toUpperCase().endsWith(".US");
+        const cur = quoteCurrency(ticker);
+        const isUS = cur !== "PLN"; // = trzeba przeliczać walutę
         const fxRange = cfg.range === "1d" || cfg.range === "5d" ? "1mo" : cfg.range;
         const fxInterval = cfg.interval.endsWith("m") ? "1d" : cfg.interval;
         const [rows, fxRows] = await Promise.all([
           fetchYahooSeries(toYahooSymbol(ticker), cfg.range, cfg.interval),
-          isUS ? fetchYahooSeries("PLN=X", fxRange, fxInterval).catch(() => null) : Promise.resolve(null),
+          isUS ? fetchYahooSeries(FX_SYMBOL[cur], fxRange, fxInterval).catch(() => null) : Promise.resolve(null),
         ]);
         let series = rows.map((r) => ({ t: new Date(r.date).getTime(), native: r.close }));
         if (isUS) {
@@ -2186,9 +2318,9 @@ function StockDetailScreen({ ticker, transactions, portfolios, prices, twelveDat
           series = series.map((p) => {
             while (i + 1 < fx.length && fx[i + 1].t <= p.t) i++;
             const rate = fx.length ? (fx[i].t <= p.t ? fx[i].rate : fx[0].rate) : fallbackRate;
-            return { t: p.t, price: rate ? p.native * rate : p.native };
+            return { t: p.t, price: rate ? p.native * rate * fxMultiplierUnit(ticker) : p.native };
           });
-          if (!fx.length) throw new Error("brak kursu USD/PLN do przeliczenia");
+          if (!fx.length) throw new Error(`brak kursu ${cur}/PLN do przeliczenia`);
         } else {
           series = series.map((p) => ({ t: p.t, price: p.native }));
         }
@@ -2552,15 +2684,105 @@ function TransactionForm({ portfolios, onManage, onClose, onSubmit }) {
   );
 }
 
-function HistorySheet({ transactions, portfolioName, onClose, onDelete }) {
+function HistorySheet({ transactions, portfolioName, portfolios, onClose, onDelete, onDeleteMany, onMoveMany }) {
+  const [pf, setPf] = useState("all");
+  const [tk, setTk] = useState("all");
+  const [target, setTarget] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  const inPf = pf === "all" ? transactions : transactions.filter((t) => t.portfolioId === pf);
+  const tickers = [...new Set(inPf.map((t) => t.ticker))].sort();
+  const visible = tk === "all" ? inPf : inPf.filter((t) => t.ticker === tk);
+  const filtered = pf !== "all" || tk !== "all";
+  const ids = visible.map((t) => t.id);
+  const targets = portfolios.filter((p) => p.id !== pf);
+
+  const chip = (active) =>
+    `px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap ${active ? "bg-amber-400 text-slate-950" : "bg-slate-800 text-slate-400"}`;
+
   return (
     <Sheet onClose={onClose}>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-base font-bold">Historia transakcji</h2>
         <button onClick={onClose} className="text-slate-500"><X size={20} /></button>
       </div>
+
+      <p className="text-xs text-slate-500 mb-2">Portfel</p>
+      <div className="flex gap-1.5 overflow-x-auto pb-1 mb-3">
+        <button className={chip(pf === "all")} onClick={() => { setPf("all"); setTk("all"); setConfirmDelete(false); }}>Wszystkie</button>
+        {portfolios.map((p) => (
+          <button key={p.id} className={chip(pf === p.id)} onClick={() => { setPf(p.id); setTk("all"); setConfirmDelete(false); }}>
+            {p.name} ({transactions.filter((t) => t.portfolioId === p.id).length})
+          </button>
+        ))}
+      </div>
+
+      <p className="text-xs text-slate-500 mb-2">Spółka</p>
+      <select
+        value={tk}
+        onChange={(e) => { setTk(e.target.value); setConfirmDelete(false); }}
+        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2.5 text-sm mb-3"
+      >
+        <option value="all">Wszystkie spółki ({inPf.length})</option>
+        {tickers.map((t) => (
+          <option key={t} value={t}>{t} ({inPf.filter((x) => x.ticker === t).length})</option>
+        ))}
+      </select>
+
+      {filtered && visible.length > 0 && (
+        <div className="rounded-xl bg-slate-900 border border-slate-800 p-3 mb-4">
+          <p className="text-xs text-slate-400 mb-2">Działania na {visible.length} widocznych transakcjach:</p>
+          <div className="flex gap-2 mb-2">
+            <select
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              className="flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-lg px-2 py-2 text-sm"
+            >
+              <option value="">Przenieś do portfela…</option>
+              {targets.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <button
+              disabled={!target}
+              onClick={() => {
+                onMoveMany(ids, target);
+                setNotice(`Przeniesiono ${ids.length} transakcji do portfela ${portfolioName(target)}.`);
+                setTarget("");
+              }}
+              className="px-3 py-2 rounded-lg bg-amber-400 text-slate-950 text-sm font-semibold disabled:opacity-40"
+            >
+              Przenieś
+            </button>
+          </div>
+          {!confirmDelete ? (
+            <button onClick={() => setConfirmDelete(true)} className="w-full py-2 rounded-lg bg-slate-800 text-rose-400 text-sm font-medium">
+              Usuń wszystkie ({visible.length})
+            </button>
+          ) : (
+            <div className="flex gap-2">
+              <button onClick={() => setConfirmDelete(false)} className="flex-1 py-2 rounded-lg bg-slate-800 text-slate-300 text-sm">Anuluj</button>
+              <button
+                onClick={() => {
+                  onDeleteMany(ids);
+                  setNotice(`Usunięto ${ids.length} transakcji.`);
+                  setConfirmDelete(false);
+                  setTk("all");
+                }}
+                className="flex-1 py-2 rounded-lg bg-rose-500 text-slate-950 text-sm font-semibold"
+              >
+                Tak, usuń {visible.length}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {!filtered && (
+        <p className="text-xs text-slate-600 mb-3">Wybierz portfel lub spółkę, żeby przenieść albo usunąć wiele transakcji naraz.</p>
+      )}
+      {notice && <p className="text-xs text-emerald-400 mb-3">{notice}</p>}
+
       <div className="space-y-2">
-        {transactions.map((t) => (
+        {visible.map((t) => (
           <div key={t.id} className="flex items-center gap-3 bg-slate-900 border border-slate-800 rounded-xl p-3">
             <div className={`w-2 h-2 rounded-full shrink-0 ${t.type === "buy" ? "bg-emerald-400" : "bg-rose-400"}`} />
             <div className="min-w-0 flex-1">
@@ -2574,6 +2796,7 @@ function HistorySheet({ transactions, portfolioName, onClose, onDelete }) {
             </button>
           </div>
         ))}
+        {!visible.length && <p className="text-sm text-slate-500 text-center py-6">Brak transakcji</p>}
       </div>
     </Sheet>
   );
@@ -2666,6 +2889,81 @@ function parseIngMaklerskiCsv(text) {
     txs.push(normalizeTx({ ticker, name: ticker.replace(/\.PL$/, ""), type, quantity, price, currency: "PLN", date }));
   }
   return txs;
+}
+
+// ---- PPK: eksport "history_*.csv" (Znak, Data wyceny, Rodzaj wpłaty, Wartość jednostki, Liczba jednostek, Saldo...) ----
+const PPK_TICKER = "PPK.FUND";
+function detectPpkCsv(text) {
+  const head = text.split(/\r?\n/)[0] || "";
+  return head.includes("Liczba jednostek") && head.includes("Wartość jednostki") && head.includes("Saldo jednostek po transakcji");
+}
+function parsePpkCsv(text) {
+  const res = Papa.parse(text, { header: true, skipEmptyLines: true });
+  const num = (v) => parseFloat(String(v ?? "").replace(/[\s\u00a0]/g, "").replace(",", "."));
+  const rows = res.data
+    .map((r, i) => {
+      const units = num(r["Liczba jednostek"]);
+      let unitValue = num(r["Wartość jednostki"]);
+      const net = num(r["Kwota transakcji netto"]);
+      if (!Number.isFinite(unitValue) && Number.isFinite(net) && units) unitValue = net / units;
+      return {
+        i,
+        date: String(r["Data wyceny"] || r["Data zlecenia"] || "").trim(),
+        sign: String(r["Znak"] || "+").trim() === "-" ? -1 : 1,
+        register: String(r["Rodzaj wpłaty"] || "").trim(),
+        units,
+        unitValue,
+        balance: num(r["Saldo jednostek po transakcji"]),
+      };
+    })
+    .filter((r) => r.date && Number.isFinite(r.units) && r.units > 0 && Number.isFinite(r.unitValue));
+  if (!rows.length) return { txs: [], openingUnits: 0, nav: null };
+  // Plik jest od najnowszych — sortujemy chronologicznie (przy tej samej dacie zachowujemy kolejność z pliku od końca)
+  rows.sort((a, b) => a.date.localeCompare(b.date) || b.i - a.i);
+
+  const txs = rows.map((r) => ({
+    ticker: PPK_TICKER,
+    name: "PPK",
+    type: r.sign > 0 ? "buy" : "sell",
+    quantity: r.units,
+    price: r.unitValue,
+    currency: "PLN",
+    date: r.date,
+  }));
+
+  // Stan początkowy: jeśli saldo rejestru po pierwszej transakcji w pliku jest większe niż ta transakcja,
+  // to wcześniejsze jednostki nie są w pliku — dodajemy je jako jedną pozycję otwarcia.
+  const firstByRegister = {};
+  for (const r of rows) if (!firstByRegister[r.register]) firstByRegister[r.register] = r;
+  const opening = [];
+  let openingUnits = 0;
+  for (const r of Object.values(firstByRegister)) {
+    if (!Number.isFinite(r.balance)) continue;
+    const before = r.balance - r.sign * r.units;
+    if (before > 0.0005) {
+      openingUnits += before;
+      opening.push({ units: before, price: r.unitValue });
+    }
+  }
+  if (openingUnits > 0) {
+    const d = new Date(rows[0].date);
+    d.setDate(d.getDate() - 1);
+    const value = opening.reduce((s, o) => s + o.units * o.price, 0);
+    txs.unshift({
+      ticker: PPK_TICKER,
+      name: "PPK",
+      type: "buy",
+      quantity: Math.round(openingUnits * 1000) / 1000,
+      price: value / openingUnits,
+      currency: "PLN",
+      date: d.toISOString().slice(0, 10),
+      opening: true,
+    });
+  }
+  const last = rows[rows.length - 1];
+  const nav = { price: last.unitValue, asOf: last.date };
+  for (const t of txs) { t.replaceGroup = true; t.fundNav = nav; }
+  return { txs, openingUnits, nav };
 }
 
 function parseXtbWorkbook(wb) {
@@ -2775,6 +3073,14 @@ function ImportModal({ portfolios, onAddPortfolio, onClose, onImport }) {
         let text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
         if (text.includes("\ufffd")) {
           text = new TextDecoder("windows-1250", { fatal: false }).decode(buf);
+        }
+        if (detectPpkCsv(text)) {
+          const { txs } = parsePpkCsv(text);
+          if (txs.length) {
+            setAutoTxs(txs);
+            setColumns(["__auto__"]);
+            return;
+          }
         }
         if (detectIngMaklerskiCsv(text)) {
           const txs = parseIngMaklerskiCsv(text);
