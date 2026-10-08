@@ -87,7 +87,7 @@ const SEED_XTB_TRANSACTIONS = [
 const CURRENCIES = ["PLN", "USD", "EUR"];
 const STORAGE_KEY = "portfolio:transactions";
 const PORTFOLIOS_KEY = "portfolio:portfolios";
-const APP_VERSION = "v13";
+const APP_VERSION = "v14";
 const PRICES_KEY = "portfolio:prices-cache";
 const DIVIDENDS_KEY = "portfolio:dividends-cache";
 const TWELVEDATA_KEY_STORAGE = "portfolio:twelvedata-api-key";
@@ -638,7 +638,7 @@ async function fetchYahooQuote(ticker, usdPlnRate) {
     return { price: last.close, changeAbsolute, changePercent, currency: "PLN", asOf: last.date };
   }
   const fx = (cur === "USD" && usdPlnRate ? usdPlnRate : await latestFxRate(cur)) * fxMultiplierUnit(ticker);
-  return { price: last.close * fx, changeAbsolute: changeAbsolute * fx, changePercent, currency: "PLN", asOf: last.date };
+  return { price: last.close * fx, changeAbsolute: changeAbsolute * fx, changePercent, currency: "PLN", asOf: last.date, fxOk: true };
 }
 
 async function fetchStooqQuote(ticker, usdPlnRate) {
@@ -770,7 +770,14 @@ export default function App() {
 
       try {
         const p = await window.storage.get(PRICES_KEY, false);
-        if (p?.value) setPrices(JSON.parse(p.value));
+        if (p?.value) {
+          const cached = JSON.parse(p.value);
+          for (const [tk, q] of Object.entries(cached)) {
+            const cur = quoteCurrency(tk);
+            if ((cur === "EUR" || cur === "GBP") && !q?.fxOk) delete cached[tk];
+          }
+          setPrices(cached);
+        }
       } catch (e) {}
       try {
         const d = await window.storage.get(DIVIDENDS_KEY, false);
@@ -1059,6 +1066,13 @@ export default function App() {
     setRefreshError(parts.join(" · "));
     setRefreshing(false);
   }, [holdings, prices, twelveDataKey]);
+
+  const autoRefreshed = useRef(false);
+  useEffect(() => {
+    if (!loaded || autoRefreshed.current || !holdings.length) return;
+    autoRefreshed.current = true;
+    refreshPrices();
+  }, [loaded, holdings.length, refreshPrices]);
 
   const refreshDividends = useCallback(async () => {
     const byTicker = {};
